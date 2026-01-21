@@ -1,3 +1,10 @@
+# 1. 初始化 Conda 环境
+CONDA_BASE="$(conda info --base)"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
+# 激活安装了 bpy 的环境
+conda activate texgaussian
+
 #（可选）只编译 3090/4090 的算力，缩短时间 #但其实没用
 export TORCH_CUDA_ARCH_LIST="8.6;8.9"
 
@@ -34,7 +41,7 @@ USE_LONGCLIP="True"
 
 # 最大处理样本数 (-1 表示处理所有样本)
 # 用于快速测试或部分推理
-MAX_SAMPLES=2
+MAX_SAMPLES=4
 
 # 多GPU配置
 # GPU_IDS: 使用的GPU编号，逗号分隔 (例如: "0,1,2,3")
