@@ -23,7 +23,8 @@ OUT_ROOT="../datasets/texverse_rendered"
 
 # 并行配置: GPU 数量
 NUM_GPUS=2
-GPU_LIST=$(seq -s, 0 $((NUM_GPUS - 1)))
+GPU_IDS=$(seq -s, 0 $((NUM_GPUS - 1)))
+WORKERS_PER_GPU="auto"          # 每GPU进程数：'auto' 自动计算，或指定数字
 
 # 资源: HDRI 环境贴图 (lit 渲染必需，可配置多个)
 #HDRI_PATHS=(
@@ -40,7 +41,8 @@ echo "Start Rendering GT (Lit+Unlit)"
 echo "Manifest: $MANIFEST_PATH"
 echo "Output:   $OUT_ROOT/{obj_id}/(lit|unlit)"
 echo "HDRIs:    ${HDRI_PATHS[*]}"
-echo "Workers:  $NUM_GPUS (GPUs: $GPU_LIST)"
+echo "GPUs:     $GPU_IDS (num=$NUM_GPUS)"
+echo "Workers:  $WORKERS_PER_GPU per GPU"
 echo "=========================================="
 
 # 3. 执行 Python 渲染命令
@@ -54,8 +56,9 @@ python ./scripts/render_gt_dataset.py \
   --save-blend \
   --background transparent \
   --unlit-only \
-  --workers "$NUM_GPUS" \
-  --gpu-list "$GPU_LIST"
+  --gpu-ids "$GPU_IDS" \
+  --num-gpus "$NUM_GPUS" \
+  --workers-per-gpu "$WORKERS_PER_GPU"
 
 echo "Done."
 

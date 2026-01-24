@@ -801,6 +801,13 @@ def pick_field(row: Dict[str, str], candidates: List[str]) -> str:
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
+    # Check if running in worker mode first (worker only needs minimal args)
+    if "--_worker-mode" in argv:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--_worker-mode", action="store_true")
+        parser.add_argument("--_worker-config", type=str, required=True)
+        return parser.parse_args(argv)
+    
     parser = argparse.ArgumentParser(description="Render GT dataset for TexGaussian (lit + unlit).")
     parser.add_argument("--manifest", required=True, help="Path to manifest_extracted.tsv (Step 2).")
     parser.add_argument("--out-root", required=True, help="Dataset root. Will create {obj_id}/lit and {obj_id}/unlit.")
@@ -820,14 +827,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode for lit renders (default: hdri).")
     parser.add_argument("--save-blend", action="store_true", help="Save a .blend file per object for inspection.")
     parser.add_argument("--unlit-only", action="store_true", help="Render unlit channels only (skip lit PBR).")
-    # Multi-GPU parallelism arguments
-    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers (GPUs). Default 1 (serial).")
-    parser.add_argument("--gpu-list", type=str, default=None, help="Comma-separated list of GPU IDs to use (e.g., '0,1,2,3').")
-    # Internal arguments for worker processes
-    parser.add_argument("--shard", type=int, default=None, help="(Internal) Shard index for this worker.")
-    parser.add_argument("--num-shards", type=int, default=None, help="(Internal) Total number of shards.")
-    parser.add_argument("--gpu-id", type=int, default=None, help="(Internal) GPU ID for this worker.")
-    parser.add_argument("--rnd-file", type=str, default=None, help="(Internal) Path to pre-computed rnd values file.")
+    # Multi-GPU parallel rendering options
+    parser.add_argument("--gpu-ids", type=str, default="0", help="Comma-separated GPU IDs (e.g., '0,1,2,3').")
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs to use.")
+    parser.add_argument("--workers-per-gpu", type=str, default="auto", help="Workers per GPU: 'auto' or integer.")
+    # Legacy arguments (kept for backward compatibility)
+    parser.add_argument("--workers", type=int, default=None, help="(Deprecated) Use --num-gpus instead.")
+    parser.add_argument("--gpu-list", type=str, default=None, help="(Deprecated) Use --gpu-ids instead.")
     return parser.parse_args(argv)
 
 
@@ -841,58 +847,266 @@ def precompute_rnd_values(num_objects: int, seed: int, views: int) -> List[float
     return [rng.random() * views for _ in range(num_objects)]
 
 
-def launch_worker_subprocess(
-    script_path: str,
-    base_argv: List[str],
-    shard: int,
-    num_shards: int,
-    gpu_id: int,
-    rnd_file: str,
-) -> subprocess.Popen:
-    """Launch a worker subprocess for a specific shard and GPU."""
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    env["PYTHONUNBUFFERED"] = "1"  # Force unbuffered output for real-time logging
-    
-    # Build worker command
-    worker_argv = base_argv + [
-        "--shard", str(shard),
-        "--num-shards", str(num_shards),
-        "--gpu-id", str(gpu_id),
-        "--rnd-file", rnd_file,
-    ]
-    
-    # Determine how to run the script based on how we were invoked
-    python_exe = sys.executable
-    exe_basename = os.path.basename(python_exe).lower()
-    
-    # Check if we're running via "blender --background --python" or directly via "python"
-    # When running via blender, the executable basename is "blender" or "blender.exe"
-    # When running via python (with bpy module installed), the basename is "python" or "python3"
-    if exe_basename.startswith("blender"):
-        # Running via blender --background --python
-        cmd = [python_exe, "--background", "--python", script_path, "--"] + worker_argv
-    else:
-        # Running directly via python (bpy module installed in conda env)
-        cmd = [python_exe, script_path] + worker_argv
-    
-    log(f"Launching worker shard {shard}/{num_shards} on GPU {gpu_id}")
-    return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+# ===================== Multi-GPU Utilities =====================
+import pickle
+import shutil
+
+def parse_gpu_ids(gpu_ids_str: str) -> List[int]:
+    """Parse GPU IDs from comma-separated string."""
+    gpu_ids_str = gpu_ids_str.strip()
+    if gpu_ids_str.startswith('[') and gpu_ids_str.endswith(']'):
+        gpu_ids_str = gpu_ids_str[1:-1]
+    return [int(x.strip()) for x in gpu_ids_str.split(',') if x.strip()]
 
 
-def stream_worker_output(proc: subprocess.Popen, shard: int) -> None:
-    """Stream output from a worker process in real-time."""
+def estimate_workers_per_gpu(gpu_id: int, vram_per_worker_gb: float = 4.0) -> tuple:
+    """Estimate workers for Blender rendering based on GPU memory."""
     try:
-        for line in iter(proc.stdout.readline, b''):
-            if line:
-                print(f"[Worker {shard}] {line.decode('utf-8', errors='replace').rstrip()}")
-        proc.stdout.close()
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits', '-i', str(gpu_id)],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            total_mb = int(result.stdout.strip())
+            total_gb = total_mb / 1024
+            estimated = int(total_gb * 0.85 / vram_per_worker_gb)
+            workers = max(1, min(estimated, 6))
+            return workers, total_gb
     except Exception:
         pass
+    return 2, 0
+
+
+def calculate_workers_per_gpu(gpu_ids: List[int], workers_str: str) -> int:
+    """Calculate workers per GPU."""
+    workers_str = str(workers_str).strip().lower()
+    
+    if workers_str == 'auto':
+        if not gpu_ids:
+            return 1
+        workers, total_mem = estimate_workers_per_gpu(gpu_ids[0])
+        if total_mem > 0:
+            log(f"Auto-detected GPU memory: {total_mem:.1f} GB")
+        log(f"Auto-calculated workers_per_gpu: {workers}")
+        return workers
+    else:
+        try:
+            return max(1, int(workers_str))
+        except ValueError:
+            return 2
+
+
+def run_worker_subprocess(
+    gpu_id: int,
+    worker_id: int,
+    tasks: List[Dict[str, str]],
+    task_indices: List[int],
+    rnd_values: List[float],
+    args_dict: Dict[str, Any],
+    result_file: str,
+    script_path: str
+) -> subprocess.Popen:
+    """Launch a Python subprocess for a worker."""
+    
+    config = {
+        'tasks': tasks,
+        'task_indices': task_indices,
+        'rnd_values': rnd_values,
+        'args_dict': args_dict,
+        'result_file': result_file,
+        'gpu_id': gpu_id,
+        'worker_id': worker_id,
+    }
+    config_file = result_file.replace('.pkl', '_config.pkl')
+    with open(config_file, 'wb') as f:
+        pickle.dump(config, f)
+    
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    cmd = [
+        sys.executable,
+        script_path,
+        '--_worker-mode',
+        '--_worker-config', config_file,
+    ]
+    
+    log(f"Launching worker GPU {gpu_id} W{worker_id} ({len(tasks)} tasks)...")
+    
+    p = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return p
+
+
+def run_multi_gpu_render(args: argparse.Namespace, tasks: List[Dict[str, str]], rnd_values: List[float]) -> int:
+    """Coordinate multi-GPU parallel rendering."""
+    
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    
+    if args.num_gpus > 0 and args.num_gpus < len(gpu_ids):
+        gpu_ids = gpu_ids[:args.num_gpus]
+    
+    workers_per_gpu = calculate_workers_per_gpu(gpu_ids, args.workers_per_gpu)
+    num_gpus = len(gpu_ids)
+    total_workers = num_gpus * workers_per_gpu
+    
+    log(f"Using {num_gpus} GPU(s): {gpu_ids}")
+    log(f"Workers per GPU: {workers_per_gpu}")
+    log(f"Total parallel workers: {total_workers}")
+    
+    # Distribute tasks across workers
+    worker_tasks = [[] for _ in range(total_workers)]
+    worker_indices = [[] for _ in range(total_workers)]
+    worker_rnds = [[] for _ in range(total_workers)]
+    
+    for idx, (task, rnd) in enumerate(zip(tasks, rnd_values)):
+        worker_idx = idx % total_workers
+        worker_tasks[worker_idx].append(task)
+        worker_indices[worker_idx].append(idx)
+        worker_rnds[worker_idx].append(rnd)
+    
+    # Show distribution
+    for gpu_idx, gpu_id in enumerate(gpu_ids):
+        gpu_total = sum(len(worker_tasks[gpu_idx * workers_per_gpu + w]) for w in range(workers_per_gpu))
+        log(f"  GPU {gpu_id}: {gpu_total} tasks ({workers_per_gpu} workers)")
+    
+    # Prepare args dict for workers
+    args_dict = {
+        'out_root': args.out_root,
+        'hdri': args.hdri,
+        'hdri_strength': args.hdri_strength,
+        'resolution': args.resolution,
+        'views': args.views,
+        'radius': args.radius,
+        'focal_length': args.focal_length,
+        'samples': args.samples,
+        'seed': args.seed,
+        'background': args.background,
+        'save_blend': args.save_blend,
+        'unlit_only': args.unlit_only,
+    }
+    
+    temp_dir = tempfile.mkdtemp(prefix="gt_render_")
+    log(f"Using temp directory: {temp_dir}")
+    
+    script_path = os.path.abspath(__file__)
+    
+    processes = []
+    result_files = []
+    
+    for gpu_idx, gpu_id in enumerate(gpu_ids):
+        for local_worker_id in range(workers_per_gpu):
+            global_worker_idx = gpu_idx * workers_per_gpu + local_worker_id
+            task_list = worker_tasks[global_worker_idx]
+            idx_list = worker_indices[global_worker_idx]
+            rnd_list = worker_rnds[global_worker_idx]
+            
+            if not task_list:
+                continue
+            
+            result_file = os.path.join(temp_dir, f"result_gpu{gpu_id}_w{local_worker_id}.pkl")
+            result_files.append((gpu_id, local_worker_id, result_file))
+            
+            p = run_worker_subprocess(
+                gpu_id, local_worker_id, task_list, idx_list, rnd_list,
+                args_dict, result_file, script_path
+            )
+            processes.append((gpu_id, local_worker_id, p))
+    
+    log(f"Waiting for {len(processes)} workers to complete...")
+    for gpu_id, worker_id, p in processes:
+        stdout, _ = p.communicate()
+        if stdout:
+            for line in stdout.decode('utf-8', errors='replace').splitlines():
+                print(f"[GPU {gpu_id} W{worker_id}] {line}")
+        if p.returncode != 0:
+            log(f"Worker GPU {gpu_id} W{worker_id} exited with code {p.returncode}")
+    
+    total_success = 0
+    for gpu_id, worker_id, result_file in result_files:
+        if os.path.exists(result_file):
+            with open(result_file, 'rb') as f:
+                result = pickle.load(f)
+            total_success += result.get('success', 0)
+            log(f"Collected from GPU {gpu_id} W{worker_id}: {result.get('success', 0)}/{result.get('total', 0)} success")
+    
+    try:
+        shutil.rmtree(temp_dir)
+    except Exception as e:
+        log(f"Failed to cleanup temp dir: {e}")
+    
+    return total_success
+
+
+def worker_main(config_file: str) -> None:
+    """Worker entry point - runs inside subprocess."""
+    
+    with open(config_file, 'rb') as f:
+        config = pickle.load(f)
+    
+    tasks = config['tasks']
+    task_indices = config['task_indices']
+    rnd_values = config['rnd_values']
+    args_dict = config['args_dict']
+    result_file = config['result_file']
+    gpu_id = config['gpu_id']
+    worker_id = config['worker_id']
+    
+    worker_tag = f"[GPU {gpu_id} W{worker_id}]"
+    log(f"{worker_tag} Starting with {len(tasks)} tasks")
+    log(f"{worker_tag} CUDA_VISIBLE_DEVICES = {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    
+    # Reconstruct args namespace
+    class Args:
+        pass
+    args = Args()
+    for k, v in args_dict.items():
+        setattr(args, k, v)
+    
+    # Build hdri entries
+    args.hdris = build_hdri_entries(args.hdri)
+    args.multi_hdri = len(args.hdris) > 1 if not args.unlit_only else False
+    
+    success = 0
+    for i, (task, orig_idx, rnd_value) in enumerate(zip(tasks, task_indices, rnd_values)):
+        oid = task.get("obj_id", f"idx_{orig_idx}")
+        mode_label = "unlit-only" if args.unlit_only else "lit+unlit"
+        log(f"{worker_tag} [{i + 1}/{len(tasks)}] Rendering {oid} ({mode_label})")
+        try:
+            ok = render_object(task, args, rnd_value)
+            success += int(ok)
+        except Exception as e:
+            log(f"{oid}: render failed with error {e}")
+        finally:
+            clear_data_blocks()
+    
+    result = {
+        'success': success,
+        'total': len(tasks),
+        'gpu_id': gpu_id,
+        'worker_id': worker_id,
+    }
+    with open(result_file, 'wb') as f:
+        pickle.dump(result, f)
+    
+    log(f"{worker_tag} Finished. Success: {success}/{len(tasks)}")
 
 
 def main(argv: List[str]) -> None:
     args = parse_args(argv)
+    
+    # Check if running in worker mode
+    if getattr(args, '_worker_mode', False):
+        if not args._worker_config:
+            log("Worker mode requires --_worker-config")
+            return
+        worker_main(args._worker_config)
+        return
+    
     args.out_root = os.path.abspath(args.out_root)
     manifest_path = os.path.abspath(args.manifest)
     manifest_dir = os.path.dirname(manifest_path)
@@ -938,118 +1152,42 @@ def main(argv: List[str]) -> None:
 
     log(f"Loaded {len(tasks)} entries from manifest.")
 
-    # ========== Multi-GPU parallel mode (master process) ==========
-    is_worker = args.shard is not None and args.num_shards is not None
+    # Handle backward compatibility with legacy arguments
+    if args.workers is not None and args.workers > 1:
+        # Legacy mode: --workers N means N GPUs with 1 worker each
+        args.num_gpus = args.workers
+        args.workers_per_gpu = "1"
+        if args.gpu_list:
+            args.gpu_ids = args.gpu_list
     
-    if not is_worker and args.workers > 1:
-        # Master process: pre-compute rnd values and launch workers
-        log(f"Starting parallel rendering with {args.workers} workers...")
-        
-        # Pre-compute rnd values for all objects (same order as serial execution)
-        rnd_values = precompute_rnd_values(len(tasks), args.seed, args.views)
-        
-        # Write rnd values to a temporary file
-        rnd_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-        json.dump(rnd_values, rnd_file)
-        rnd_file.close()
-        rnd_file_path = rnd_file.name
-        
-        try:
-            # Parse GPU list
-            if args.gpu_list:
-                gpu_ids = [int(g.strip()) for g in args.gpu_list.split(",")]
-            else:
-                gpu_ids = list(range(args.workers))
-            
-            if len(gpu_ids) < args.workers:
-                log(f"Warning: only {len(gpu_ids)} GPUs specified for {args.workers} workers")
-                gpu_ids = (gpu_ids * ((args.workers // len(gpu_ids)) + 1))[:args.workers]
-            
-            # Build base argv (exclude worker-specific args)
-            base_argv = [
-                "--manifest", manifest_path,
-                "--out-root", args.out_root,
-                "--resolution", str(args.resolution),
-                "--views", str(args.views),
-                "--radius", str(args.radius),
-                "--focal-length", str(args.focal_length),
-                "--samples", str(args.samples),
-                "--seed", str(args.seed),
-                "--background", args.background,
-            ]
-            if args.unlit_only:
-                base_argv.append("--unlit-only")
-            if args.save_blend:
-                base_argv.append("--save-blend")
-            for entry in args.hdris:
-                base_argv.extend(["--hdri", entry["path"]])
-            
-            # Launch worker processes
-            script_path = os.path.abspath(__file__)
-            processes = []
-            output_threads = []
-            for shard in range(args.workers):
-                gpu_id = gpu_ids[shard]
-                proc = launch_worker_subprocess(
-                    script_path, base_argv, shard, args.workers, gpu_id, rnd_file_path
-                )
-                processes.append((shard, proc))
-                # Start a thread to stream output in real-time
-                t = threading.Thread(target=stream_worker_output, args=(proc, shard), daemon=True)
-                t.start()
-                output_threads.append(t)
-            
-            # Wait for all workers to complete
-            for shard, proc in processes:
-                proc.wait()
-                if proc.returncode != 0:
-                    log(f"Worker {shard} exited with code {proc.returncode}")
-            
-            # Wait for output threads to finish
-            for t in output_threads:
-                t.join(timeout=2.0)
-            
-            log("All workers completed.")
-        finally:
-            # Clean up temporary file
-            if os.path.exists(rnd_file_path):
-                os.unlink(rnd_file_path)
-        return
-
-    # ========== Worker mode or serial mode ==========
-    # Load pre-computed rnd values if in worker mode
-    if is_worker and args.rnd_file:
-        with open(args.rnd_file, 'r') as f:
-            all_rnd_values = json.load(f)
-        log(f"Worker shard {args.shard}/{args.num_shards} on GPU {args.gpu_id}")
+    # Pre-compute rnd values for all objects (same order as serial execution)
+    rnd_values = precompute_rnd_values(len(tasks), args.seed, args.views)
+    
+    # Determine if we should use multi-process mode
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    workers_per_gpu = calculate_workers_per_gpu(gpu_ids, args.workers_per_gpu)
+    total_workers = len(gpu_ids) * workers_per_gpu
+    
+    # Use multi-process mode when total_workers > 1
+    if total_workers > 1:
+        log(f"Running in multi-process mode (GPUs: {gpu_ids}, workers/GPU: {workers_per_gpu}, total: {total_workers})...")
+        success = run_multi_gpu_render(args, tasks, rnd_values)
+        log(f"Completed. Total success: {success}/{len(tasks)}")
     else:
-        # Serial mode: compute rnd values on-the-fly (same as original behavior)
-        all_rnd_values = precompute_rnd_values(len(tasks), args.seed, args.views)
-
-    # Determine which tasks to process
-    if is_worker:
-        # Shard the tasks: each worker handles tasks[shard::num_shards]
-        task_indices = list(range(args.shard, len(tasks), args.num_shards))
-    else:
-        task_indices = list(range(len(tasks)))
-
-    success = 0
-    for i, idx in enumerate(task_indices):
-        row = tasks[idx]
-        rnd_value = all_rnd_values[idx]
-        oid = row.get("obj_id", f"idx_{idx}")
-        mode_label = "unlit-only" if args.unlit_only else "lit+unlit"
-        progress = f"[{i + 1}/{len(task_indices)}]" if is_worker else f"[{idx + 1}/{len(tasks)}]"
-        log(f"{progress} Rendering {oid} ({mode_label})")
-        try:
-            ok = render_object(row, args, rnd_value)
-            success += int(ok)
-        except Exception as e:
-            log(f"{oid}: render failed with error {e}")
-        finally:
-            clear_data_blocks()
-
-    log(f"Completed. Success: {success}/{len(task_indices)}")
+        # Single worker mode - render directly in this process
+        success = 0
+        for idx, (task, rnd_value) in enumerate(zip(tasks, rnd_values)):
+            oid = task.get("obj_id", f"idx_{idx}")
+            mode_label = "unlit-only" if args.unlit_only else "lit+unlit"
+            log(f"[{idx + 1}/{len(tasks)}] Rendering {oid} ({mode_label})")
+            try:
+                ok = render_object(task, args, rnd_value)
+                success += int(ok)
+            except Exception as e:
+                log(f"{oid}: render failed with error {e}")
+            finally:
+                clear_data_blocks()
+        log(f"Completed. Success: {success}/{len(tasks)}")
 
 
 if __name__ == "__main__":
