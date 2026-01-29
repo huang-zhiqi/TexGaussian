@@ -38,6 +38,7 @@ PASS_CONFIG = [
     ("rough", "Non-Color"),
     ("metal", "Non-Color"),
     ("normal", "Non-Color"),
+    ("depth", "Non-Color"),   # 深度图用于多视角一致性评估
 ]
 
 
@@ -406,6 +407,78 @@ def build_geometry_normal_material(name: str) -> bpy.types.Material:
     return mat
 
 
+def build_depth_material(name: str, near: float = 0.1, far: float = 10.0) -> bpy.types.Material:
+    """Builds a material that outputs normalized camera-space depth.
+    
+    The depth is normalized to [0, 1] range where:
+    - 0 = near plane (closest)
+    - 1 = far plane (farthest)
+    
+    This is essential for multi-view consistency evaluation via reprojection.
+    
+    Args:
+        name: Material name
+        near: Near plane distance
+        far: Far plane distance
+    
+    Returns:
+        Blender material outputting normalized depth as grayscale emission
+    """
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    for n in list(nodes):
+        nodes.remove(n)
+
+    # Camera Data node gives us view depth (distance from camera in camera-space Z)
+    cam_data = nodes.new("ShaderNodeCameraData")
+    cam_data.location = (-600, 0)
+    
+    # Math node to normalize: (depth - near) / (far - near)
+    # Step 1: Subtract near
+    sub_near = nodes.new("ShaderNodeMath")
+    sub_near.operation = "SUBTRACT"
+    sub_near.inputs[1].default_value = near
+    sub_near.location = (-400, 0)
+    
+    # Step 2: Divide by (far - near)
+    div_range = nodes.new("ShaderNodeMath")
+    div_range.operation = "DIVIDE"
+    div_range.inputs[1].default_value = far - near
+    div_range.location = (-200, 0)
+    
+    # Clamp to [0, 1]
+    clamp = nodes.new("ShaderNodeClamp")
+    clamp.inputs["Min"].default_value = 0.0
+    clamp.inputs["Max"].default_value = 1.0
+    clamp.location = (0, 0)
+    
+    # Convert to RGB (grayscale)
+    combine = nodes.new("ShaderNodeCombineXYZ")
+    combine.location = (200, 0)
+    
+    # Emission output
+    emis = nodes.new("ShaderNodeEmission")
+    emis.inputs["Strength"].default_value = 1.0
+    emis.location = (400, 0)
+    
+    out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (600, 0)
+    
+    # Connect: CameraData.ViewZ -> Sub -> Div -> Clamp -> Combine -> Emission -> Output
+    links.new(cam_data.outputs["View Z Depth"], sub_near.inputs[0])
+    links.new(sub_near.outputs["Value"], div_range.inputs[0])
+    links.new(div_range.outputs["Value"], clamp.inputs["Value"])
+    links.new(clamp.outputs["Result"], combine.inputs["X"])
+    links.new(clamp.outputs["Result"], combine.inputs["Y"])
+    links.new(clamp.outputs["Result"], combine.inputs["Z"])
+    links.new(combine.outputs["Vector"], emis.inputs["Color"])
+    links.new(emis.outputs["Emission"], out.inputs["Surface"])
+    
+    return mat
+
+
 def compute_intrinsics(cam_obj: bpy.types.Object, scene: bpy.types.Scene) -> Dict[str, float]:
     cam = cam_obj.data
     render = scene.render
@@ -625,6 +698,11 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     if not normal_path:
         log(f"{oid}: normal map missing, using geometry normals for lit and unlit.")
 
+    # Extract depth parameters from GT transforms.json meta for consistency
+    depth_meta = meta.get("depth", {})
+    depth_near = depth_meta.get("near", 0.1)
+    depth_far = depth_meta.get("far", 4.0)  # Default to radius*2.0 where radius=2.0
+
     mat_lit = build_pbr_material(albedo, rough, metal, normal_path)
     emission_mats: Dict[str, bpy.types.Material] = {}
     for name, cs in PASS_CONFIG:
@@ -634,6 +712,10 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
                 if normal_path
                 else build_geometry_normal_material(f"{name.upper()}_GEO")
             )
+            continue
+        if name == "depth":
+            # Depth is computed from geometry using GT's near/far parameters
+            emission_mats[name] = build_depth_material(f"{name.upper()}_MAT", near=depth_near, far=depth_far)
             continue
         path = {"albedo": albedo, "rough": rough, "metal": metal}.get(name)
         if path and os.path.exists(path):
