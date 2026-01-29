@@ -193,6 +193,11 @@ def parse_args() -> argparse.Namespace:
         choices=["albedo", "lit", "normal"],
         help="Which channel to use for cross-view consistency: albedo, lit (beauty), or normal.",
     )
+    parser.add_argument(
+        "--reprojection",
+        action="store_true",
+        help="Also compute depth-based reprojection metrics (requires depth maps and dense views).",
+    )
     return parser.parse_args()
 
 
@@ -897,28 +902,67 @@ def select_adjacent_view_pairs(
     frames: List[Dict],
     num_pairs: int,
     seed: int = 42,
+    max_angle_deg: float = 90.0,
 ) -> List[Tuple[int, int]]:
-    """Select pairs of adjacent views for consistency evaluation.
+    """Select pairs of views for consistency evaluation.
     
-    Adjacent views are consecutive frames (0-1, 1-2, ..., N-1-0 for cyclic).
-    Returns list of (frame_idx1, frame_idx2) pairs.
+    Selects view pairs with the smallest angular separation for meaningful
+    reprojection metrics. Always returns the pairs with smallest angles
+    available in the dataset.
+    
+    Args:
+        frames: List of frame dicts containing 'world_to_camera' matrices
+        num_pairs: Maximum number of pairs to return
+        seed: Random seed for reproducibility
+        max_angle_deg: Unused (kept for API compatibility)
+        
+    Returns:
+        List of (frame_idx1, frame_idx2) pairs sorted by angular separation.
     """
     n_frames = len(frames)
     if n_frames < 2:
         return []
     
-    # Create all possible adjacent pairs (cyclic)
-    all_pairs = [(i, (i + 1) % n_frames) for i in range(n_frames)]
+    # Extract camera positions from world_to_camera matrices
+    # world_to_camera: camera_point = M @ world_point
+    # Camera position in world = inverse(M)[:3, 3]
+    # For 4x4 matrix M = [R|t], camera position = -R^T @ t
+    positions = []
+    for f in frames:
+        m = np.array(f["world_to_camera"], dtype=np.float64)
+        R = m[:3, :3]
+        t = m[:3, 3]
+        cam_pos = -R.T @ t
+        positions.append(cam_pos)
+    positions = np.array(positions)
     
-    # Limit to num_pairs
+    # Compute angles between all pairs of camera view directions
+    # Assuming cameras look toward origin, view direction ~ -cam_pos (normalized)
+    view_dirs = -positions / (np.linalg.norm(positions, axis=1, keepdims=True) + 1e-8)
+    
+    # Compute all pair angles
+    all_pairs_with_angles = []
+    for i in range(n_frames):
+        for j in range(i + 1, n_frames):
+            cos_angle = np.clip(np.dot(view_dirs[i], view_dirs[j]), -1.0, 1.0)
+            angle = np.rad2deg(np.arccos(cos_angle))
+            all_pairs_with_angles.append((i, j, angle))
+    
+    # Sort by angle (prefer smaller angles)
+    all_pairs_with_angles.sort(key=lambda x: x[2])
+    
     rng = np.random.default_rng(seed)
-    if len(all_pairs) > num_pairs:
-        indices = rng.choice(len(all_pairs), size=num_pairs, replace=False)
-        pairs = [all_pairs[i] for i in sorted(indices)]
-    else:
-        pairs = all_pairs
     
-    return pairs
+    # Take pairs with smallest angles, with some randomness
+    top_candidates = all_pairs_with_angles[:min(len(all_pairs_with_angles), num_pairs * 2)]
+    
+    if len(top_candidates) > num_pairs:
+        indices = rng.choice(len(top_candidates), size=num_pairs, replace=False)
+        selected = [top_candidates[i] for i in sorted(indices)]
+    else:
+        selected = top_candidates
+    
+    return [(p[0], p[1]) for p in selected]
 
 
 def load_image_rgba(path: str, device: torch.device) -> torch.Tensor:
@@ -1113,12 +1157,17 @@ def compute_multiview_consistency_metrics(
 ) -> Dict[str, float]:
     """Compute multi-view consistency metrics across all objects.
     
+    These metrics compare image content directly between view pairs without
+    requiring depth maps or 3D reprojection. They work well even with sparse
+    view datasets (e.g., fibonacci_sphere with 16 views).
+    
     Metrics computed:
-    - CrossView_LPIPS: Perceptual consistency between adjacent views (lower = better)
+    - CrossView_LPIPS: Perceptual consistency between view pairs (lower = better)
     - CrossView_L1: Pixel-level consistency (lower = better)
     - Normal_Consistency: Angular consistency of surface normals (lower = better)
     - Normal_Distribution_Div: Divergence of normal distributions (lower = better)
     - GT_CrossView_LPIPS/L1: Same metrics for GT (for comparison)
+    - View_Pair_Angle: Average angle between selected view pairs (informational)
     
     Args:
         base_gt_dir: Root GT render directory
@@ -1141,6 +1190,8 @@ def compute_multiview_consistency_metrics(
     gt_l1_scores: List[float] = []
     normal_consistency_scores: List[float] = []
     normal_dist_div_scores: List[float] = []
+    view_pair_angles: List[float] = []  # Track angles for diagnostics
+    mask_overlap_ratios: List[float] = []  # Track overlap for diagnostics
     
     print(f"Computing multi-view consistency metrics ({channel} channel)...")
     
@@ -1168,14 +1219,30 @@ def compute_multiview_consistency_metrics(
             print(f"[WARN] Not enough frames for {obj_id}, skipping.")
             continue
         
-        # Select view pairs
+        # Select view pairs (prefer pairs with smaller angular separation)
         pairs = select_adjacent_view_pairs(frames, num_pairs, seed=42 + obj_idx)
+        
+        # Compute view directions for angle calculation
+        positions = []
+        for f in frames:
+            m = np.array(f["world_to_camera"], dtype=np.float64)
+            R = m[:3, :3]
+            t = m[:3, 3]
+            cam_pos = -R.T @ t
+            positions.append(cam_pos)
+        positions_arr = np.array(positions)
+        view_dirs = -positions_arr / (np.linalg.norm(positions_arr, axis=1, keepdims=True) + 1e-8)
         
         for idx1, idx2 in pairs:
             frame1 = frames[idx1]
             frame2 = frames[idx2]
             prefix1 = frame1.get("file_prefix", f"{idx1:03d}")
             prefix2 = frame2.get("file_prefix", f"{idx2:03d}")
+            
+            # Record angle between this view pair
+            cos_angle = np.clip(np.dot(view_dirs[idx1], view_dirs[idx2]), -1.0, 1.0)
+            pair_angle = np.rad2deg(np.arccos(cos_angle))
+            view_pair_angles.append(pair_angle)
             
             # Determine image paths based on channel
             if channel == "lit":
@@ -1212,6 +1279,13 @@ def compute_multiview_consistency_metrics(
             try:
                 gen_img1 = load_image_rgba(gen_path1, device)
                 gen_img2 = load_image_rgba(gen_path2, device)
+                
+                # Record mask overlap ratio
+                alpha1 = gen_img1[:, 3:4, ...] > 0.5
+                alpha2 = gen_img2[:, 3:4, ...] > 0.5
+                mask_overlap = (alpha1 & alpha2).float().mean().item()
+                if mask_overlap > 0:
+                    mask_overlap_ratios.append(mask_overlap)
                 
                 # Compute generated metrics
                 gen_l1 = compute_cross_view_l1(gen_img1, gen_img2)
@@ -1301,6 +1375,13 @@ def compute_multiview_consistency_metrics(
         gt_val = metrics["GT_CrossView_L1"]
         if gt_val > 1e-6:
             metrics["CrossView_L1_Ratio"] = metrics["CrossView_L1"] / gt_val
+    
+    # Add diagnostic info about view pairs
+    if view_pair_angles:
+        metrics["View_Pair_Angle_Mean"] = float(np.mean(view_pair_angles))
+        metrics["View_Pair_Angle_Min"] = float(np.min(view_pair_angles))
+    if mask_overlap_ratios:
+        metrics["Mask_Overlap_Ratio"] = float(np.mean(mask_overlap_ratios))
     
     return metrics
 
@@ -1421,7 +1502,8 @@ def compute_reprojection_error(
     grid = torch.stack([u2_norm, v2_norm], dim=-1).unsqueeze(0)  # (1, H, W, 2)
     
     # Sample img2 at projected coordinates
-    img1_warped = F.grid_sample(
+    # This gives us the colors from img2 at the locations where img1 pixels project to
+    img2_sampled = F.grid_sample(
         img2,
         grid,
         mode='bilinear',
@@ -1435,7 +1517,7 @@ def compute_reprojection_error(
     # 3. Alpha valid in both images
     in_bounds = (u2 >= 0) & (u2 < W) & (v2 >= 0) & (v2 < H)
     depth_valid = (z2 > 0) & (d1 > 0)
-    alpha_valid = (img1[:, 3, :, :] > 0.5) & (img1_warped[:, 3, :, :] > 0.5)
+    alpha_valid = (img1[:, 3, :, :] > 0.5) & (img2_sampled[:, 3, :, :] > 0.5)
     
     valid_mask = (in_bounds & depth_valid & alpha_valid.squeeze(0)).float().unsqueeze(0).unsqueeze(0)
     valid_count = valid_mask.sum().item()
@@ -1444,18 +1526,20 @@ def compute_reprojection_error(
         return float("nan"), float("nan"), 0.0
     
     # Compute L1 error on RGB
+    # Compare img1 with img2 sampled at projected locations
+    # If consistent, img1[p] should equal img2[project(p)]
     rgb1 = img1[:, :3, :, :]
-    rgb1_warped = img1_warped[:, :3, :, :]
-    l1_diff = (rgb1 - rgb1_warped).abs() * valid_mask
+    rgb2_sampled = img2_sampled[:, :3, :, :]
+    l1_diff = (rgb1 - rgb2_sampled).abs() * valid_mask
     l1_error = l1_diff.sum() / (valid_count * 3.0)
     
     # Compute LPIPS error if model provided
     lpips_error = float("nan")
     if lpips_model is not None:
         rgb1_masked = rgb1 * valid_mask
-        rgb1_warped_masked = rgb1_warped * valid_mask
+        rgb2_sampled_masked = rgb2_sampled * valid_mask
         with torch.no_grad():
-            lpips_val = lpips_model(rgb1_masked * 2.0 - 1.0, rgb1_warped_masked * 2.0 - 1.0)
+            lpips_val = lpips_model(rgb1_masked * 2.0 - 1.0, rgb2_sampled_masked * 2.0 - 1.0)
             lpips_error = lpips_val.mean().item()
     
     valid_ratio = valid_count / (H * W)
@@ -1496,14 +1580,16 @@ def compute_reprojection_metrics(
     gt_reproj_l1: List[float] = []
     gt_reproj_lpips: List[float] = []
     valid_ratios: List[float] = []
+    skipped_pairs = 0
+    total_pairs = 0
     
     # Check if depth maps are available
     sample_obj = obj_ids[0] if obj_ids else None
     if sample_obj:
         sample_depth = os.path.join(base_gen_dir, sample_obj, unlit_subdir, "000_depth.png")
         if not os.path.exists(sample_depth):
-            print("[INFO] Depth maps not found. Skipping reprojection metrics.")
-            print("       Run render_gt_dataset.py with updated version to generate depth maps.")
+            print("[INFO] Depth maps not found in gen dir. Skipping reprojection metrics.")
+            print("       Run render_gen_aligned.py with depth enabled to generate depth maps.")
             return {}
     
     print("Computing reprojection-based consistency metrics...")
@@ -1558,6 +1644,7 @@ def compute_reprojection_metrics(
                 continue
             
             try:
+                total_pairs += 1
                 # Compute relative pose
                 rel_pose = compute_relative_pose(frame1, frame2)
                 
@@ -1570,6 +1657,13 @@ def compute_reprojection_metrics(
                 l1, lpips_err, valid_ratio = compute_reprojection_error(
                     gen_img1, gen_img2, gen_d1, intrinsics, rel_pose, lpips_model
                 )
+                
+                if valid_ratio < 0.01:  # Less than 1% valid pixels
+                    skipped_pairs += 1
+                    if debug:
+                        print(f"[DEBUG] {obj_id} pair ({idx1},{idx2}): valid_ratio={valid_ratio:.4f}, skipping")
+                    del gen_img1, gen_img2, gen_d1
+                    continue
                 
                 if math.isfinite(l1):
                     gen_reproj_l1.append(l1)
@@ -1605,6 +1699,17 @@ def compute_reprojection_metrics(
         if (obj_idx + 1) % 10 == 0:
             print(f"  Processed {obj_idx + 1}/{len(obj_ids)} objects for reprojection...")
             _clear_cuda_cache()
+    
+    # Report statistics
+    if total_pairs > 0:
+        skip_rate = 100 * skipped_pairs / total_pairs
+        print(f"  Total pairs: {total_pairs}, Skipped (low overlap): {skipped_pairs} ({skip_rate:.1f}%)")
+        
+        if skipped_pairs == total_pairs:
+            print("  [INFO] All view pairs skipped due to insufficient overlap (<1% valid pixels).")
+            print("         This typically happens with sparse view datasets (e.g., fibonacci_sphere with <24 views)")
+            print("         where view angles between any pair exceed ~30 degrees.")
+            print("         Consider using CrossView_LPIPS/L1 metrics instead for such datasets.")
     
     # Compile metrics
     metrics: Dict[str, float] = {}
@@ -2148,28 +2253,30 @@ def main() -> None:
             for k, v in consistency_metrics.items():
                 print(f"  {k}: {v:.6f}")
             
-            # 2. Reprojection-based metrics (requires depth maps, optional)
-            print("\n--- Computing Reprojection Metrics (if depth available) ---")
-            reproj_metrics = compute_reprojection_metrics(
-                base_gt_dir=base_gt_dir,
-                base_gen_dir=base_gen_dir,
-                unlit_subdir=args.unlit_subdir,
-                obj_ids=obj_ids,
-                device=device,
-                lpips_model=consistency_lpips_model,
-                num_pairs=args.consistency_pairs,
-                debug=args.debug,
-            )
-            
-            if reproj_metrics:
-                for metric_name, value in reproj_metrics.items():
-                    final_metrics[f"Consistency/{metric_name}"] = value
+            # 2. Reprojection-based metrics (optional, requires depth maps and dense views)
+            if args.reprojection:
+                print("\n--- Computing Reprojection Metrics (--reprojection enabled) ---")
+                reproj_metrics = compute_reprojection_metrics(
+                    base_gt_dir=base_gt_dir,
+                    base_gen_dir=base_gen_dir,
+                    unlit_subdir=args.unlit_subdir,
+                    obj_ids=obj_ids,
+                    device=device,
+                    lpips_model=consistency_lpips_model,
+                    num_pairs=args.consistency_pairs,
+                    debug=args.debug,
+                )
                 
-                print("Reprojection metrics computed successfully.")
-                for k, v in reproj_metrics.items():
-                    print(f"  {k}: {v:.6f}")
-            else:
-                print("Reprojection metrics skipped (no depth maps found).")
+                if reproj_metrics:
+                    for metric_name, value in reproj_metrics.items():
+                        final_metrics[f"Consistency/{metric_name}"] = value
+                    
+                    print("Reprojection metrics computed successfully.")
+                    for k, v in reproj_metrics.items():
+                        print(f"  {k}: {v:.6f}")
+                else:
+                    print("Reprojection metrics skipped (no valid results).")
+                    print("  Sparse views may have insufficient overlap for reprojection.")
             
         except Exception as e:
             print(f"[ERROR] Failed to compute consistency metrics: {e}")
