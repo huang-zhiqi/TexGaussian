@@ -1,6 +1,38 @@
 #!/bin/bash
 # 计算 GT 与生成结果之间的指标，参数与 scripts/eval_metrics.py 保持一致
 
+# ============================================
+# 指标说明 (↑ = 越大越好, ↓ = 越小越好)
+# ============================================
+#
+# === Unlit 通道指标 (逐像素比较) ===
+# Albedo_PSNR_Masked      ↑  峰值信噪比，衡量颜色重建质量
+# Albedo_SSIM_Masked      ↑  结构相似性，衡量感知质量
+# Albedo_LPIPS_Masked     ↓  感知损失，越小越相似
+# Roughness_L1            ↓  粗糙度通道的L1误差
+# Metallic_L1             ↓  金属度通道的L1误差
+# Normal_MeanAngularError ↓  法线角度误差（度），越小越准确
+#
+# === Lit 分布指标 (整体分布比较) ===
+# FID                     ↓  Fréchet Inception Distance，越小分布越接近
+# KID_mean                ↓  Kernel Inception Distance，越小越好
+# KID_std                 -  KID的标准差，仅供参考
+#
+# === Lit 语义指标 (CLIP相似度) ===
+# CLIP_Image_Similarity   ↑  图像级CLIP相似度 (Gen vs GT)
+# CLIP_Text_Similarity    ↑  图像-文本CLIP相似度 (Gen vs caption_short)
+# LongCLIP_Text_Similarity↑  长文本CLIP相似度 (Gen vs caption_long)
+#
+# === 多视角一致性指标 (检测Janus问题) ===
+# CrossView_LPIPS         ↓  相邻视角感知一致性，越小越一致
+# CrossView_L1            ↓  相邻视角像素一致性
+# Normal_Consistency      ↑  法线跨视角一致性，越大越好
+# Normal_Distribution_Div ↓  法线分布散度，越小说明无多面问题
+# Reproj_L1               ↓  重投影误差（需深度图）
+# Reproj_LPIPS            ↓  重投影感知误差（需深度图）
+#
+# ============================================
+
 # 不使用 set -e，防止脚本自动退出
 set -uo pipefail
 
@@ -14,8 +46,8 @@ set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
-EXPERIMENT_NAME="${1:-exp003_test_batch_short}"
-BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered/test"}"
+EXPERIMENT_NAME="${1:-texgaussian_baseline}"
+BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered_test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
 # If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will compute per-HDRI stats + mean.
 # Lit metrics are recorded under HDRI/Mean/* (no top-level lit keys).
@@ -23,9 +55,9 @@ BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_re
 LIT_SUBDIR="${LIT_SUBDIR:-"lit"}"
 UNLIT_SUBDIR="${UNLIT_SUBDIR:-"unlit"}"
 # 降低默认批量大小以避免 OOM (从 8 改为 4)
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 DEVICE="${DEVICE:-cuda}"
-KID_SUBSET_SIZE="${KID_SUBSET_SIZE:-50}"
+KID_SUBSET_SIZE="${KID_SUBSET_SIZE:-100}"
 CLIP_MODEL="${CLIP_MODEL:-"ViT-B/32"}"
 LONGCLIP_MODEL="${LONGCLIP_MODEL:-"../third_party/Long-CLIP/checkpoints/longclip-L.pt"}"
 LONGCLIP_ROOT="${LONGCLIP_ROOT:-"../third_party/Long-CLIP"}"

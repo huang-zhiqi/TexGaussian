@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="texgaussian_baseline_long_LongCLIP_2GPU"
+EXP_NAME="texgaussian_baseline_mini"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -32,16 +32,16 @@ BATCH_TSV="../experiments/common_splits/test.tsv"
 OUTPUT_ROOT="../experiments/${EXP_NAME}"
 
 # 文本字段（caption_short 或 caption_long）
-CAPTION_FIELD="caption_long"
+CAPTION_FIELD="caption_short"
 
 # 是否使用 LongCLIP（True/False）
 # LongCLIP 支持更长的文本描述（最长248 tokens），适合 caption_long
 # 标准 CLIP 上下文长度为 77 tokens，适合 caption_short
-USE_LONGCLIP="True"
+USE_LONGCLIP="False"
 
 # 最大处理样本数 (-1 表示处理所有样本)
 # 用于快速测试或部分推理
-MAX_SAMPLES=4
+MAX_SAMPLES=20
 
 # 多GPU配置
 # GPU_IDS: 使用的GPU编号，逗号分隔 (例如: "0,1,2,3")
