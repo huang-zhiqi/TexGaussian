@@ -18,14 +18,14 @@ conda activate blender
 # 2. 路径配置（按需修改）
 
 # 生成结果的 manifest（路径支持相对路径）
-MANIFEST_PATH="../experiments/texgaussian_baseline/generated_manifest.tsv"
+MANIFEST_PATH="../experiments/texgaussian_baseline_mini/generated_manifest.tsv"
 
 # GT 渲染结果根目录（内部包含 {obj_id}/transforms.json）
 GT_ROOT="../datasets/texverse_rendered_test"
 TRANSFORMS_SUBDIR=""   # 可选：如果 transforms 在子目录内，设置该值
 
 # 输出目录
-OUT_ROOT="../experiments/texgaussian_baseline/texverse_gen_renders"
+OUT_ROOT="../experiments/texgaussian_baseline_mini/texverse_gen_renders"
 
 # HDRI（lit 渲染必需，可配置多个）
 HDRI_PATHS=(
