@@ -49,8 +49,8 @@ MAX_SAMPLES=20
 # WORKERS_PER_GPU: 每张GPU上并行运行的进程数
 #   - "auto": 根据GPU显存自动计算最优值 (推荐)
 #   - 数字 (如 "2"): 手动指定固定数量
-GPU_IDS="0,1"
-NUM_GPUS=2
+GPU_IDS="0"
+NUM_GPUS=1
 WORKERS_PER_GPU="auto"
 
 # ==========================================

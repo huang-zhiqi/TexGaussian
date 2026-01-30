@@ -4,6 +4,8 @@ import csv
 import json
 import subprocess
 import copy
+import time
+from datetime import datetime, timedelta
 from dataclasses import asdict, is_dataclass
 import tyro
 import tqdm
@@ -599,7 +601,7 @@ def to_jsonable(obj):
     except Exception:
         return str(obj)
 
-def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None, manifest_path=None):
+def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None, manifest_path=None, timing_info=None):
     cfg = {
         "options": to_jsonable(opt),
         "ckpt_path": opt.ckpt_path,
@@ -611,6 +613,8 @@ def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None
         cfg["skipped_samples"] = skipped_samples
     if manifest_path:
         cfg["result_tsv"] = os.path.abspath(manifest_path)
+    if timing_info:
+        cfg["timing"] = timing_info
 
     os.makedirs(exp_dir, exist_ok=True)
     config_path = os.path.join(exp_dir, "config.json")
@@ -1086,6 +1090,11 @@ if __name__ == "__main__":
     print(f"[INFO] Using {len(gpu_ids)} GPU(s): {gpu_ids}")
     print(f"[INFO] Workers per GPU: {workers_per_gpu}")
 
+    # Record start time for inference timing
+    inference_start_time = time.time()
+    inference_start_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[INFO] Inference started at: {inference_start_datetime}")
+
     if opt.tsv_path:
         tsv_dir = os.path.dirname(os.path.abspath(opt.tsv_path))
         batch_rows = load_batch_from_tsv(opt.tsv_path, opt.caption_field)
@@ -1119,7 +1128,40 @@ if __name__ == "__main__":
 
         if processed_samples:
             write_result_manifest(result_tsv_path, processed_samples)
-        save_experiment_config(output_dir, opt, processed_samples, skipped_samples, manifest_path=result_tsv_path if processed_samples else None)
+        
+        # Calculate and display timing information
+        inference_end_time = time.time()
+        inference_end_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        total_time_seconds = inference_end_time - inference_start_time
+        total_time_str = str(timedelta(seconds=int(total_time_seconds)))
+        num_samples = len(processed_samples) if processed_samples else 0
+        avg_time_per_sample = total_time_seconds / num_samples if num_samples > 0 else 0
+        
+        timing_info = {
+            "start_time": inference_start_datetime,
+            "end_time": inference_end_datetime,
+            "total_seconds": round(total_time_seconds, 2),
+            "total_time_formatted": total_time_str,
+            "num_samples_processed": num_samples,
+            "avg_seconds_per_sample": round(avg_time_per_sample, 2),
+            "num_gpus": len(gpu_ids),
+            "workers_per_gpu": workers_per_gpu,
+            "total_workers": len(gpu_ids) * workers_per_gpu,
+        }
+        
+        print(f"\n" + "="*60)
+        print(f"[TIMING] Inference completed!")
+        print(f"[TIMING] Start time: {inference_start_datetime}")
+        print(f"[TIMING] End time: {inference_end_datetime}")
+        print(f"[TIMING] Total time: {total_time_str} ({total_time_seconds:.2f} seconds)")
+        print(f"[TIMING] Samples processed: {num_samples}")
+        print(f"[TIMING] Average time per sample: {avg_time_per_sample:.2f} seconds")
+        print(f"[TIMING] GPUs used: {len(gpu_ids)}, Workers per GPU: {workers_per_gpu}")
+        print("="*60 + "\n")
+        
+        save_experiment_config(output_dir, opt, processed_samples, skipped_samples, 
+                               manifest_path=result_tsv_path if processed_samples else None,
+                               timing_info=timing_info)
     else:
         # Single sample mode - always single GPU
         converter = Converter(opt).cuda()
@@ -1132,6 +1174,31 @@ if __name__ == "__main__":
         sample_output_dir = os.path.join(textures_dir, opt.texture_name)
         converter.export_mesh(sample_output_dir)
 
+        # Calculate and display timing information for single sample mode
+        inference_end_time = time.time()
+        inference_end_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        total_time_seconds = inference_end_time - inference_start_time
+        total_time_str = str(timedelta(seconds=int(total_time_seconds)))
+        
+        timing_info = {
+            "start_time": inference_start_datetime,
+            "end_time": inference_end_datetime,
+            "total_seconds": round(total_time_seconds, 2),
+            "total_time_formatted": total_time_str,
+            "num_samples_processed": 1,
+            "avg_seconds_per_sample": round(total_time_seconds, 2),
+            "num_gpus": 1,
+            "workers_per_gpu": 1,
+            "total_workers": 1,
+        }
+        
+        print(f"\n" + "="*60)
+        print(f"[TIMING] Inference completed!")
+        print(f"[TIMING] Start time: {inference_start_datetime}")
+        print(f"[TIMING] End time: {inference_end_datetime}")
+        print(f"[TIMING] Total time: {total_time_str} ({total_time_seconds:.2f} seconds)")
+        print("="*60 + "\n")
+
         processed_samples = [build_result_row(opt.texture_name, sample_output_dir)]
         write_result_manifest(result_tsv_path, processed_samples)
-        save_experiment_config(output_dir, opt, processed_samples, manifest_path=result_tsv_path)
+        save_experiment_config(output_dir, opt, processed_samples, manifest_path=result_tsv_path, timing_info=timing_info)
