@@ -46,23 +46,24 @@ set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
-EXPERIMENT_NAME="${1:-texgaussian_baseline}"
+EXPERIMENT_NAME="${1:-texgaussian_baseline_mini}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered_test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
-# If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will compute per-HDRI stats + mean.
-# Lit metrics are recorded under HDRI/Mean/* (no top-level lit keys).
-# To evaluate a single HDRI, set LIT_SUBDIR="lit/<hdri_name>".
+# If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will combine all images
+# from all HDRIs to compute FID/KID (more statistically stable).
+# Lit metrics are recorded directly (e.g., FID, KID, CLIP_Image_Score).
 LIT_SUBDIR="${LIT_SUBDIR:-"lit"}"
 UNLIT_SUBDIR="${UNLIT_SUBDIR:-"unlit"}"
 # 降低默认批量大小以避免 OOM (从 8 改为 4)
 BATCH_SIZE="${BATCH_SIZE:-4}"
 DEVICE="${DEVICE:-cuda}"
+# KID subset size: 100 is recommended for stable estimation
 KID_SUBSET_SIZE="${KID_SUBSET_SIZE:-100}"
 CLIP_MODEL="${CLIP_MODEL:-"ViT-B/32"}"
 LONGCLIP_MODEL="${LONGCLIP_MODEL:-"../third_party/Long-CLIP/checkpoints/longclip-L.pt"}"
 LONGCLIP_ROOT="${LONGCLIP_ROOT:-"../third_party/Long-CLIP"}"
 LONGCLIP_CONTEXT_LENGTH="${LONGCLIP_CONTEXT_LENGTH:-248}"
-OUTPUT="${OUTPUT:-"../experiments/${EXPERIMENT_NAME}/metrics_${EXPERIMENT_NAME}.json"}"
+OUTPUT="${OUTPUT:-"../experiments/${EXPERIMENT_NAME}/metrics.json"}"
 PROMPTS_FILE="${PROMPTS_FILE:-"../experiments/${EXPERIMENT_NAME}/generated_manifest.tsv"}"
 
 # 多视角一致性指标参数 (CVPR 2025 / ECCV 2024-2025 标准)

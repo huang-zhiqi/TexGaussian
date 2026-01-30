@@ -27,7 +27,7 @@ Usage:
 The script reads images directly from their source directories without copying them
 elsewhere. GT and Gen filenames are assumed to align for each channel.
 If lit renders are stored under per-HDRI subfolders (lit/<hdri_name>), the script
-computes lit metrics per HDRI and reports their mean under HDRI/Mean/*.
+combines all images from all HDRIs to compute FID/KID (more statistically stable).
 """
 
 import argparse
@@ -2003,53 +2003,55 @@ def main() -> None:
                     obj_id: long_text_features[i] for i, obj_id in enumerate(obj_ids)
                 }
 
-        def run_lit_for_subdir(label: str, lit_subdir: str) -> Dict[str, float]:
-            lit_gt_paths, lit_gen_paths = collect_lit_paths(
-                base_gt_dir,
-                base_gen_dir,
-                lit_subdir,
-                obj_ids,
-            )
-            if not lit_gt_paths:
-                raise RuntimeError(f"No lit image pairs found for {label}.")
-            print(f"Lit pairs ({label}): {len(lit_gt_paths)} images across {len(obj_ids)} objects.")
-            return compute_lit_metrics_for_paths(
-                lit_gt_paths,
-                lit_gen_paths,
-                base_gen_dir,
-                batch_size,
-                device,
-                metric_flags,
-                clip_model,
-                clip_preprocess,
-                longclip_model,
-                longclip_preprocess,
-                longclip_module,
-                clip_text_feature_map,
-                longclip_text_feature_map,
-                do_clip_image,
-                do_clip_text,
-                do_longclip_text,
-                args.kid_subset_size,
-            )
-
-        lit_metrics_by_hdri: Dict[str, Dict[str, float]] = {}
+        # Collect all lit image paths across all HDRIs for combined FID/KID computation
+        all_lit_gt_paths: List[str] = []
+        all_lit_gen_paths: List[str] = []
         if lit_hdris:
             for hdri in lit_hdris:
                 lit_subdir = os.path.join(args.lit_subdir, hdri)
-                print(f"== HDRI: {hdri} ==")
-                lit_metrics = run_lit_for_subdir(hdri, lit_subdir)
-                lit_metrics_by_hdri[hdri] = lit_metrics
-                for metric_name, value in lit_metrics.items():
-                    final_metrics[f"HDRI/{hdri}/{metric_name}"] = value
-
-            mean_metrics = compute_mean_metrics(lit_metrics_by_hdri)
-            for metric_name, value in mean_metrics.items():
-                final_metrics[f"HDRI/Mean/{metric_name}"] = value
+                gt_paths, gen_paths = collect_lit_paths(
+                    base_gt_dir,
+                    base_gen_dir,
+                    lit_subdir,
+                    obj_ids,
+                )
+                all_lit_gt_paths.extend(gt_paths)
+                all_lit_gen_paths.extend(gen_paths)
+            print(f"Combined lit pairs across {len(lit_hdris)} HDRIs: {len(all_lit_gt_paths)} images")
         else:
-            lit_metrics = run_lit_for_subdir(args.lit_subdir, args.lit_subdir)
-            for metric_name, value in lit_metrics.items():
-                final_metrics[f"HDRI/Mean/{metric_name}"] = value
+            all_lit_gt_paths, all_lit_gen_paths = collect_lit_paths(
+                base_gt_dir,
+                base_gen_dir,
+                args.lit_subdir,
+                obj_ids,
+            )
+            print(f"Lit pairs: {len(all_lit_gt_paths)} images across {len(obj_ids)} objects.")
+
+        if not all_lit_gt_paths:
+            raise RuntimeError("No lit image pairs found.")
+
+        # Compute lit metrics on combined images from all HDRIs
+        lit_metrics = compute_lit_metrics_for_paths(
+            all_lit_gt_paths,
+            all_lit_gen_paths,
+            base_gen_dir,
+            batch_size,
+            device,
+            metric_flags,
+            clip_model,
+            clip_preprocess,
+            longclip_model,
+            longclip_preprocess,
+            longclip_module,
+            clip_text_feature_map,
+            longclip_text_feature_map,
+            do_clip_image,
+            do_clip_text,
+            do_longclip_text,
+            args.kid_subset_size,
+        )
+        for metric_name, value in lit_metrics.items():
+            final_metrics[metric_name] = value
 
         print("Cleaning up CLIP/LongCLIP models...")
         if clip_model is not None:
