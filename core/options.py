@@ -33,6 +33,9 @@ class Options:
     ema_rate: float = 0.999
     radius: float = 1/2
     use_checkpoint: str = 'True'
+    use_world_normal: str = 'False'
+    lambda_geo_normal: float = 1.0
+    lambda_tex_normal: float = 1.0
 
     ## fit gaussians
     gaussian_list: str = 'pbr_train_list_gaussian.txt'

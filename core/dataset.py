@@ -103,6 +103,7 @@ class TexGaussianDataset(Dataset):
         pointcloud = np.load(pointcloud_path)
         results['points'] = pointcloud['points']
         results['normals'] = pointcloud['normals']
+        results['point_mesh_normals'] = pointcloud['normals']
 
         if self.opt.gaussian_loss:
             gaussian = torch.load(gaussian_path)
@@ -112,6 +113,7 @@ class TexGaussianDataset(Dataset):
         # load num_views images
         images = []
         masks = []
+        normal_maps = []
         if self.opt.use_material:
             mr_images = []
         cam_poses = []
@@ -123,6 +125,10 @@ class TexGaussianDataset(Dataset):
 
         camera_path = os.path.join(image_dir, 'cameras.npz')
         cameras = np.load(camera_path)
+
+        use_world_normal = self.opt.use_world_normal
+        if isinstance(use_world_normal, str):
+            use_world_normal = use_world_normal.lower() in ('yes', 'true', 't', 'y', '1')
 
         for vid in vids:
 
@@ -140,6 +146,23 @@ class TexGaussianDataset(Dataset):
                     mr_image = cv2.imread(mr_image_path, cv2.IMREAD_UNCHANGED)
                     mr_image = torch.from_numpy(mr_image.astype(np.float32) / 255) # [512, 512, 4] in [0, 1]
 
+                if use_world_normal:
+                    normal_candidates = [
+                        os.path.join(image_dir, f'{vid}_normal.png'),
+                        os.path.join(image_dir, f'{vid:03d}_normal.png'),
+                        os.path.join(image_dir, 'unlit', f'{vid:03d}_normal.png'),
+                        os.path.join(image_dir, 'unlit', f'{vid}_normal.png'),
+                    ]
+                    normal_path = None
+                    for cand in normal_candidates:
+                        if os.path.exists(cand):
+                            normal_path = cand
+                            break
+                    if normal_path is None:
+                        raise FileNotFoundError(f"Normal map missing for view {vid}: {image_dir}")
+                    normal_map = cv2.imread(normal_path, cv2.IMREAD_UNCHANGED)
+                    normal_map = torch.from_numpy(normal_map.astype(np.float32) / 255) # [512, 512, C] in [0, 1]
+
                 c2w = cameras['poses'][vid] # [4, 4]
                 c2w = torch.tensor(c2w, dtype=torch.float32).reshape(4, 4)
             except Exception as e:
@@ -155,10 +178,18 @@ class TexGaussianDataset(Dataset):
                 mr_image = mr_image[:3] * mask + (1 - mask) # [3, 512, 512], to white bg
                 mr_image = mr_image[[2,1,0]].contiguous() # bgr to rgb
 
+            if use_world_normal:
+                if normal_map.ndim == 3 and normal_map.shape[2] >= 3:
+                    normal_map = normal_map[:, :, :3]
+                normal_map = normal_map.permute(2, 0, 1) # [3, 512, 512]
+                normal_map = normal_map[[2,1,0]].contiguous() # bgr to rgb
+
             images.append(image)
 
             if self.opt.use_material:
                 mr_images.append(mr_image)
+            if use_world_normal:
+                normal_maps.append(normal_map)
 
             masks.append(mask.squeeze(0))
             cam_poses.append(c2w)
@@ -181,6 +212,10 @@ class TexGaussianDataset(Dataset):
 
         if self.opt.use_material:
             results['mr_images_output'] = F.interpolate(mr_images, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False) # [V, C, output_size, output_size]
+
+        if use_world_normal:
+            normal_maps = torch.stack(normal_maps, dim=0)
+            results['gt_normal_map'] = F.interpolate(normal_maps, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False)
 
         # opengl to colmap camera for gaussian renderer
         cam_poses[:, :3, 1:3] *= -1 # invert up & forward direction

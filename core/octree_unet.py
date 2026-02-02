@@ -363,7 +363,7 @@ class OctreeUNet(nn.Module):
         self.conv_out = ocnn.nn.OctreeConv(up_channels[-1], out_channels, kernel_size=[3], nempty=True, use_bias=True)
         self.conv = ocnn.nn.OctreeConv(out_channels, out_channels, kernel_size=[3], nempty=True, use_bias=True)
 
-    def forward(self, x, octree, condition = None):
+    def forward(self, x, octree, condition = None, return_features: bool = False):
         # x: [B, Cin, H, W]
 
         input_data = x
@@ -400,6 +400,7 @@ class OctreeUNet(nn.Module):
         # last
         x = self.norm_out(x, octree, depth)
         x = F.silu(x)
+        feat = x
         if self.use_checkpoint:
             x = ckpt_conv_wrapper(self.conv_out, x, octree, depth)
         else:
@@ -413,4 +414,6 @@ class OctreeUNet(nn.Module):
         assert depth == octree.depth
         assert x.shape[0] == input_data.shape[0]
 
+        if return_features:
+            return x, feat
         return x

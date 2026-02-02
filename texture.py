@@ -20,6 +20,7 @@ from core.regression_models import TexGaussian
 from core.options import AllConfigs, Options
 from core.gs import GaussianRenderer
 from external.clip import tokenize
+from export_utils import save_normal_map
 
 # LongCLIP support - lazy import
 _longclip_module = None
@@ -272,7 +273,7 @@ class Converter(nn.Module):
                 print(f'[WARN] unexpected param {k}: {v.shape}')
        
     @torch.no_grad()
-    def render_gs(self, pose, use_material = False):
+    def render_gs(self, pose, use_material = False, use_normal = False):
     
         cam_poses = torch.from_numpy(pose).unsqueeze(0).to(self.device)
         cam_poses[:, :3, 1:3] *= -1 # invert up & forward direction
@@ -284,7 +285,9 @@ class Converter(nn.Module):
 
         batch_id = self.octree_in.batch_id(self.opt.input_depth, nempty = True)
         
-        if use_material:
+        if use_normal and hasattr(self, "normal_gaussians"):
+            out = self.gs_renderer.render(self.normal_gaussians, batch_id, cam_view.unsqueeze(0), cam_view_proj.unsqueeze(0), cam_pos.unsqueeze(0))
+        elif use_material:
             out = self.gs_renderer.render(self.mr_gaussians, batch_id, cam_view.unsqueeze(0), cam_view_proj.unsqueeze(0), cam_pos.unsqueeze(0))
         else:
             out = self.gs_renderer.render(self.gaussians, batch_id, cam_view.unsqueeze(0), cam_view_proj.unsqueeze(0), cam_pos.unsqueeze(0))
@@ -294,7 +297,7 @@ class Converter(nn.Module):
 
         return image, alpha
     
-    def render_mesh(self, pose, use_material = False):
+    def render_mesh(self, pose, use_material = False, use_normal = False):
 
         h = w = self.opt.output_size
 
@@ -313,7 +316,9 @@ class Converter(nn.Module):
         alpha = dr.antialias(alpha, rast, v_clip, f).clamp(0, 1).squeeze(-1).squeeze(0) # [H, W] important to enable gradients!
         
         texc, texc_db = dr.interpolate(self.vt.unsqueeze(0), rast, self.ft, rast_db=rast_db, diff_attrs='all')
-        if use_material:
+        if use_normal:
+            image = torch.sigmoid(dr.texture(self.normal_tex.unsqueeze(0), texc, uv_da=texc_db)) # [1, H, W, 3]
+        elif use_material:
             image = torch.sigmoid(dr.texture(self.mr_albedo.unsqueeze(0), texc, uv_da=texc_db)) # [1, H, W, 3]
         else:
             image = torch.sigmoid(dr.texture(self.albedo.unsqueeze(0), texc, uv_da=texc_db)) # [1, H, W, 3]
@@ -321,7 +326,11 @@ class Converter(nn.Module):
         image = image.view(1, h, w, 3)
         # image = dr.antialias(image, rast, v_clip, f).clamp(0, 1)
         image = image.squeeze(0).permute(2, 0, 1).contiguous() # [3, H, W]
-        image = alpha * image + (1 - alpha)
+        if use_normal:
+            bg = torch.tensor([0.5, 0.5, 1.0], device=image.device).view(3, 1, 1)
+            image = alpha * image + (1 - alpha) * bg
+        else:
+            image = alpha * image + (1 - alpha)
 
         return image, alpha
     
@@ -329,9 +338,18 @@ class Converter(nn.Module):
     def fit_mesh_uv(self, iters=1024, resolution=512, texture_resolution=1024, padding=2):
 
         if self.opt.use_material:
-            _, self.gaussians, self.mr_gaussians = self.model.forward_gaussians(self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True)
+            _, self.gaussians, self.mr_gaussians, pred_normal_world = self.model.forward_gaussians(
+                self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True
+            )
         else:
-            _, self.gaussians = self.model.forward_gaussians(self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True)
+            _, self.gaussians, _, pred_normal_world = self.model.forward_gaussians(
+                self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True
+            )
+            self.mr_gaussians = None
+
+        if self.opt.use_world_normal and pred_normal_world is not None:
+            normal_colors = (pred_normal_world * 0.5 + 0.5).clamp(0, 1)
+            self.normal_gaussians = torch.cat([self.gaussians[:, :11], normal_colors], dim=-1)
 
         self.opt.output_size = resolution
 
@@ -381,6 +399,15 @@ class Converter(nn.Module):
 
         if self.opt.use_material:
             self.mr_albedo = nn.Parameter(mr_albedo).to(self.device)
+
+        if self.opt.use_world_normal:
+            normal_tex = torch.zeros(h * w, 3, device=self.device, dtype=torch.float32)
+            normal_tex = normal_tex.view(h, w, -1)
+            normal_tex[..., 0] = 0.5
+            normal_tex[..., 1] = 0.5
+            normal_tex[..., 2] = 1.0
+            normal_tex = uv_padding(normal_tex, mask, padding)
+            self.normal_tex = nn.Parameter(normal_tex).to(self.device)
         
         optimizer = torch.optim.Adam([
             {'params': self.albedo, 'lr': 1e-1},
@@ -389,6 +416,10 @@ class Converter(nn.Module):
         if self.opt.use_material:
             mr_optimizer = torch.optim.Adam([
                 {'params': self.mr_albedo, 'lr': 1e-3},
+            ])
+        if self.opt.use_world_normal:
+            normal_optimizer = torch.optim.Adam([
+                {'params': self.normal_tex, 'lr': 1e-2},
             ])
 
         vers = [-89, 89, 0, 0, 0, 0]
@@ -426,6 +457,14 @@ class Converter(nn.Module):
                 optimizer.zero_grad()
 
                 pbar.set_description(f"MSE = {loss_mse.item():.6f}")
+
+                if self.opt.use_world_normal and hasattr(self, "normal_gaussians"):
+                    normal_gt, _ = self.render_gs(pose, use_normal=True)
+                    normal_pred, _ = self.render_mesh(pose, use_normal=True)
+                    normal_loss = F.mse_loss(normal_pred, normal_gt)
+                    normal_loss.backward()
+                    normal_optimizer.step()
+                    normal_optimizer.zero_grad()
         
         pbar = tqdm.trange(iters * 2)
 
@@ -458,8 +497,19 @@ class Converter(nn.Module):
             optimizer.zero_grad()
 
             pbar.set_description(f"MSE = {loss_mse.item():.6f}")
+
+            if self.opt.use_world_normal and hasattr(self, "normal_gaussians"):
+                normal_gt, _ = self.render_gs(pose, use_normal=True)
+                normal_pred, _ = self.render_mesh(pose, use_normal=True)
+                normal_loss = F.mse_loss(normal_pred, normal_gt)
+                normal_loss.backward()
+                normal_optimizer.step()
+                normal_optimizer.zero_grad()
         
         print(f"[INFO] finished fitting mesh albedo!")
+
+        if self.opt.use_world_normal and hasattr(self, "normal_tex"):
+            self.normal_world_map = torch.sigmoid(self.normal_tex).detach().clamp(0, 1).cpu().numpy()
     
         if self.opt.use_material:
 
@@ -555,6 +605,17 @@ class Converter(nn.Module):
 
         albedo_img = torch.sigmoid(self.albedo).detach().clamp(0, 1).cpu().numpy()
         kiui.write_image(os.path.join(save_dir, 'albedo.png'), albedo_img)
+
+        if hasattr(self, "normal_world_map"):
+            try:
+                save_normal_map(
+                    mesh,
+                    self.normal_world_map,
+                    os.path.join(save_dir, 'normal.png'),
+                    flip_green=getattr(self.opt, "flip_normal_green", False),
+                )
+            except Exception as e:
+                print(f"[WARN] normal map export failed: {e}")
 
         if self.opt.use_material and hasattr(self, "mr_albedo"):
             mr_img = torch.sigmoid(self.mr_albedo).detach().clamp(0, 1).cpu().numpy()

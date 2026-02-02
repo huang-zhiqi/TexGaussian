@@ -44,6 +44,7 @@ def main():
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
     opt.use_text = str2bool(opt.use_text)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
+    opt.use_world_normal = str2bool(opt.use_world_normal)
 
     current_time = get_time()
 
@@ -81,17 +82,13 @@ def main():
         else:
             ckpt = torch.load(opt.resume, map_location='cpu')
 
-        # tolerant load (only load matching shapes)
         accelerator.print('Start loading checkpoint')
-        state_dict = model.state_dict()
-        for k, v in ckpt.items():
-            if k in state_dict:
-                if state_dict[k].shape == v.shape:
-                    state_dict[k].copy_(v)
-                else:
-                    accelerator.print(f'[WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored.')
-            else:
-                accelerator.print(f'[WARN] unexpected param {k}: {v.shape}')
+        incompatible = model.load_state_dict(ckpt, strict=False)
+        if incompatible.missing_keys:
+            accelerator.print(f"[WARN] missing keys: {len(incompatible.missing_keys)}")
+        if incompatible.unexpected_keys:
+            accelerator.print(f"[WARN] unexpected keys: {len(incompatible.unexpected_keys)}")
+        accelerator.print("Loaded base PBR weights. 'normal_head' (and 'rotation_head') weights were initialized freshly.")
 
     train_dataset = Dataset(opt, training=True)
     train_dataloader = torch.utils.data.DataLoader(
@@ -116,7 +113,27 @@ def main():
     )
 
     # optimizer
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad == True], lr=opt.lr, weight_decay=0.05, betas=(0.9, 0.95))
+    if opt.use_world_normal and hasattr(model, "normal_head"):
+        head_params = list(model.normal_head.parameters())
+        if hasattr(model, "rotation_head"):
+            head_params += list(model.rotation_head.parameters())
+        head_param_ids = {id(p) for p in head_params}
+        base_params = [p for p in model.parameters() if p.requires_grad and id(p) not in head_param_ids]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": base_params, "lr": opt.lr * 0.1},
+                {"params": head_params, "lr": opt.lr},
+            ],
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad == True],
+            lr=opt.lr,
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+        )
 
     total_steps = opt.num_epochs * len(train_dataloader)
     pct_start = 3000 / total_steps
@@ -163,6 +180,8 @@ def main():
                 albedo_loss = out['albedo_loss']
                 mask_loss = out['mask_loss']
                 lpips_loss = out['lpips_loss']
+                normal_geo_loss = out.get('normal_geo_loss', 0.0)
+                normal_tex_loss = out.get('normal_tex_loss', 0.0)
 
                 if opt.use_material:
                     mr_loss = out['mr_loss']
@@ -201,13 +220,15 @@ def main():
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} loss: {loss.item():.6f} \
 gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} mr_loss: {mr_loss:.6f} \
-mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} mr_lpips_loss: {mr_lpips_loss:.6f} time: {t:.3f}")
+mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} mr_lpips_loss: {mr_lpips_loss:.6f} \
+normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} time: {t:.3f}")
 
                     else:
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} \
 loss: {loss.item():.6f} gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} \
-mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
+mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} \
+normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} time: {t:.3f}")
 
                     # writer.add_scalar('loss', loss, epoch * len(train_dataloader) + i)
 
@@ -217,6 +238,9 @@ mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
                     writer.add_scalar('mask_loss', out['mask_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('lpips_loss', out['lpips_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('psnr', out['psnr'], epoch * len(train_dataloader) + i)
+                    if opt.use_world_normal:
+                        writer.add_scalar('normal_geo_loss', out['normal_geo_loss'], epoch * len(train_dataloader) + i)
+                        writer.add_scalar('normal_tex_loss', out['normal_tex_loss'], epoch * len(train_dataloader) + i)
 
                     if opt.use_material:
                         writer.add_scalar('mr_loss', out['mr_loss'], epoch * len(train_dataloader) + i)
