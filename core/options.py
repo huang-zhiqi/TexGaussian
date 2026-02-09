@@ -27,13 +27,14 @@ class Options:
     output_size: int = 512
     use_material: str = 'True'
     gaussian_loss: str = 'False'
+    use_normal_head: str = 'False'
+    use_rotation_head: str = 'False'
     use_text: str = 'True'
     use_local_pretrained_ckpt: str = 'False'
     text_description: str = 'Cap3D_automated_Objaverse_full.csv'
     ema_rate: float = 0.999
     radius: float = 1/2
     use_checkpoint: str = 'True'
-    use_world_normal: str = 'False'
     lambda_geo_normal: float = 1.0
     lambda_tex_normal: float = 1.0
 

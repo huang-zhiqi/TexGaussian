@@ -42,9 +42,11 @@ def main():
     opt.use_checkpoint = str2bool(opt.use_checkpoint)
     opt.use_material = str2bool(opt.use_material)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
+    opt.use_normal_head = str2bool(opt.use_normal_head)
+    opt.use_rotation_head = str2bool(opt.use_rotation_head)
     opt.use_text = str2bool(opt.use_text)
+    opt.use_longclip = str2bool(opt.use_longclip)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
-    opt.use_world_normal = str2bool(opt.use_world_normal)
 
     current_time = get_time()
 
@@ -113,8 +115,10 @@ def main():
     )
 
     # optimizer
-    if opt.use_world_normal and hasattr(model, "normal_head"):
-        head_params = list(model.normal_head.parameters())
+    if (opt.use_normal_head or opt.use_rotation_head) and (hasattr(model, "normal_head") or hasattr(model, "rotation_head")):
+        head_params = []
+        if hasattr(model, "normal_head"):
+            head_params += list(model.normal_head.parameters())
         if hasattr(model, "rotation_head"):
             head_params += list(model.rotation_head.parameters())
         head_param_ids = {id(p) for p in head_params}
@@ -238,7 +242,7 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                     writer.add_scalar('mask_loss', out['mask_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('lpips_loss', out['lpips_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('psnr', out['psnr'], epoch * len(train_dataloader) + i)
-                    if opt.use_world_normal:
+                    if opt.use_normal_head or opt.use_rotation_head:
                         writer.add_scalar('normal_geo_loss', out['normal_geo_loss'], epoch * len(train_dataloader) + i)
                         writer.add_scalar('normal_tex_loss', out['normal_tex_loss'], epoch * len(train_dataloader) + i)
 

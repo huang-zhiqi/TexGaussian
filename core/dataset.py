@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from external.clip import tokenize
 
 from core.options import Options
+from core.longclip_utils import resolve_longclip_module
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -53,6 +54,10 @@ class TexGaussianDataset(Dataset):
 
         self.opt = opt
         self.training = training
+        self.use_longclip = self.opt.use_longclip
+        if isinstance(self.use_longclip, str):
+            self.use_longclip = self.use_longclip.lower() in ('yes', 'true', 't', 'y', '1')
+        self.longclip_tokenize = None
 
         self.items = []
 
@@ -72,6 +77,8 @@ class TexGaussianDataset(Dataset):
         if opt.use_text:
             self.text_prompt = pd.read_csv(opt.text_description)
             self.text_prompt.columns = ['id', 'string']
+            if self.use_longclip:
+                _, self.longclip_tokenize = resolve_longclip_module()
 
         # default camera intrinsics
         self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.opt.fovy))
@@ -126,9 +133,9 @@ class TexGaussianDataset(Dataset):
         camera_path = os.path.join(image_dir, 'cameras.npz')
         cameras = np.load(camera_path)
 
-        use_world_normal = self.opt.use_world_normal
-        if isinstance(use_world_normal, str):
-            use_world_normal = use_world_normal.lower() in ('yes', 'true', 't', 'y', '1')
+        use_normal_head = self.opt.use_normal_head
+        if isinstance(use_normal_head, str):
+            use_normal_head = use_normal_head.lower() in ('yes', 'true', 't', 'y', '1')
 
         for vid in vids:
 
@@ -146,7 +153,7 @@ class TexGaussianDataset(Dataset):
                     mr_image = cv2.imread(mr_image_path, cv2.IMREAD_UNCHANGED)
                     mr_image = torch.from_numpy(mr_image.astype(np.float32) / 255) # [512, 512, 4] in [0, 1]
 
-                if use_world_normal:
+                if use_normal_head:
                     normal_candidates = [
                         os.path.join(image_dir, f'{vid}_normal.png'),
                         os.path.join(image_dir, f'{vid:03d}_normal.png'),
@@ -178,7 +185,7 @@ class TexGaussianDataset(Dataset):
                 mr_image = mr_image[:3] * mask + (1 - mask) # [3, 512, 512], to white bg
                 mr_image = mr_image[[2,1,0]].contiguous() # bgr to rgb
 
-            if use_world_normal:
+            if use_normal_head:
                 if normal_map.ndim == 3 and normal_map.shape[2] >= 3:
                     normal_map = normal_map[:, :, :3]
                 normal_map = normal_map.permute(2, 0, 1) # [3, 512, 512]
@@ -188,7 +195,7 @@ class TexGaussianDataset(Dataset):
 
             if self.opt.use_material:
                 mr_images.append(mr_image)
-            if use_world_normal:
+            if use_normal_head:
                 normal_maps.append(normal_map)
 
             masks.append(mask.squeeze(0))
@@ -213,7 +220,7 @@ class TexGaussianDataset(Dataset):
         if self.opt.use_material:
             results['mr_images_output'] = F.interpolate(mr_images, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False) # [V, C, output_size, output_size]
 
-        if use_world_normal:
+        if use_normal_head:
             normal_maps = torch.stack(normal_maps, dim=0)
             results['gt_normal_map'] = F.interpolate(normal_maps, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False)
 
@@ -232,7 +239,14 @@ class TexGaussianDataset(Dataset):
         if self.opt.use_text:
             text = self.text_prompt.loc[self.text_prompt['id'] == uid, 'string']
             text = text.iloc[0]
-            token = tokenize(text)
+            if self.use_longclip:
+                token = self.longclip_tokenize(
+                    text,
+                    context_length=self.opt.longclip_context_length,
+                    truncate=True,
+                )
+            else:
+                token = tokenize(text)
             token = token.squeeze()
             results['token'] = token
 

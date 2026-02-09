@@ -17,6 +17,27 @@ from core.gs import GaussianRenderer
 from ocnn.octree import Octree, Points
 from core.utils import *
 from clip_networks.network import CLIPTextEncoder
+from core.longclip_utils import load_longclip_model
+
+
+class LongCLIPTextEncoder(nn.Module):
+    def __init__(self, model_path, context_length=248, device='cuda'):
+        super().__init__()
+        self.model, _ = load_longclip_model(model_path, device)
+        if hasattr(self.model, "visual"):
+            del self.model.visual
+        self.model.requires_grad_(False)
+        self.model.eval()
+        self.context_length = context_length
+
+    def encode(self, text):
+        x = self.model.token_embedding(text)
+        x = x + self.model.positional_embedding[:x.shape[1]]
+        x = x.permute(1, 0, 2)
+        x = self.model.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.model.ln_final(x)
+        return x
 
 class TexGaussian(nn.Module):
     def __init__(self, opt, device):
@@ -29,36 +50,39 @@ class TexGaussian(nn.Module):
             self.gaussian_mean = torch.load(self.opt.mean_path).to(self.device)
             self.gaussian_std = torch.load(self.opt.std_path).to(self.device)
 
+        self.use_longclip = self.opt.use_longclip
+        if isinstance(self.use_longclip, str):
+            self.use_longclip = self.use_longclip.lower() in ('yes', 'true', 't', 'y', '1')
+
         if self.opt.use_text:
-            if self.opt.use_local_pretrained_ckpt:
-                self.text_encoder = CLIPTextEncoder(model="./ViT-L-14.pt")
+            if self.use_longclip:
+                self.text_encoder = LongCLIPTextEncoder(
+                    model_path=self.opt.longclip_model,
+                    context_length=self.opt.longclip_context_length,
+                    device=self.device,
+                )
             else:
-                self.text_encoder = CLIPTextEncoder(model="ViT-L/14")
+                if self.opt.use_local_pretrained_ckpt:
+                    self.text_encoder = CLIPTextEncoder(model="./ViT-L-14.pt")
+                else:
+                    self.text_encoder = CLIPTextEncoder(model="ViT-L/14")
             self.text_encoder.to(self.device)
 
             self.text_encoder.requires_grad_(False)
 
             self.text_encoder.eval()
 
-        self.use_world_normal = self.opt.use_world_normal
-        if isinstance(self.use_world_normal, str):
-            self.use_world_normal = self.use_world_normal.lower() in ('yes', 'true', 't', 'y', '1')
+        self.use_normal_head = self.opt.use_normal_head
+        if isinstance(self.use_normal_head, str):
+            self.use_normal_head = self.use_normal_head.lower() in ('yes', 'true', 't', 'y', '1')
+        self.use_rotation_head = self.opt.use_rotation_head
+        if isinstance(self.use_rotation_head, str):
+            self.use_rotation_head = self.use_rotation_head.lower() in ('yes', 'true', 't', 'y', '1')
         self.lambda_geo_normal = self.opt.lambda_geo_normal
         self.lambda_tex_normal = self.opt.lambda_tex_normal
 
         if self.opt.use_material:
             self.opt.out_channels += 3
-
-        if self.opt.gaussian_loss:
-            base_tail = self.opt.out_channels - 4
-            base_idx = torch.cat([
-                torch.arange(0, 4, device=self.device),
-                torch.arange(8, 8 + base_tail, device=self.device),
-            ])
-            self.gaussian_base_idx = base_idx
-            self.gaussian_mean_base = self.gaussian_mean[base_idx]
-            self.gaussian_std_base = self.gaussian_std[base_idx]
-            self.gaussian_rot_mean = self.gaussian_mean[4:8]
 
         if self.opt.input_feature == 'L':
             self.opt.in_channels = 3
@@ -88,7 +112,7 @@ class TexGaussian(nn.Module):
         self.reset_parameters()
         set_requires_grad(self.ema_model, False)
 
-        if self.use_world_normal:
+        if self.use_normal_head or self.use_rotation_head:
             normal_in = None
             if hasattr(self.model, "conv_out"):
                 if hasattr(self.model.conv_out, "in_channels"):
@@ -98,14 +122,16 @@ class TexGaussian(nn.Module):
             if normal_in is None:
                 raise RuntimeError("Cannot infer normal_head input channels from model.")
 
-            self.normal_head = ocnn.nn.OctreeConv(
-                normal_in, 3, kernel_size=[3], nempty=True, use_bias=True
-            )
-            self.rotation_head = ocnn.nn.OctreeConv(
-                normal_in, 4, kernel_size=[3], nempty=True, use_bias=True
-            )
-            self._init_head(self.normal_head, bias_value=[0.0, 0.0, 1.0])
-            self._init_head(self.rotation_head, bias_value=[1.0, 0.0, 0.0, 0.0])
+            if self.use_normal_head:
+                self.normal_head = ocnn.nn.OctreeConv(
+                    normal_in, 3, kernel_size=[3], nempty=True, use_bias=True
+                )
+                self._init_head(self.normal_head, bias_value=[0.0, 0.0, 1.0])
+            if self.use_rotation_head:
+                self.rotation_head = ocnn.nn.OctreeConv(
+                    normal_in, 4, kernel_size=[3], nempty=True, use_bias=True
+                )
+                self._init_head(self.rotation_head, bias_value=[1.0, 0.0, 0.0, 0.0])
 
         # Gaussian Renderer
         self.gs = GaussianRenderer(opt)
@@ -118,7 +144,7 @@ class TexGaussian(nn.Module):
         self.rgb_act = lambda x: torch.sigmoid(x)   # [0, 1]
         if self.opt.use_material:
             self.mr_act = lambda x: torch.sigmoid(x)
-        if self.use_world_normal:
+        if self.use_normal_head:
             self.normal_act = lambda x: F.normalize(x, dim=-1)
 
         self.input_depth = self.opt.input_depth
@@ -164,39 +190,39 @@ class TexGaussian(nn.Module):
         # x: [N, 4]
         # return: Gaussians: [N, dim_t]
 
+        use_extra_heads = self.use_normal_head or self.use_rotation_head
         if ema:
-            if self.use_world_normal:
+            if use_extra_heads:
                 base_out, feat = self.ema_model(x, octree, condition, return_features=True)
             else:
                 base_out = self.ema_model(x, octree, condition)
         else:
-            if self.use_world_normal:
+            if use_extra_heads:
                 base_out, feat = self.model(x, octree, condition, return_features=True)
             else:
                 base_out = self.model(x, octree, condition) # [N, out_channels]
 
         pred_normal_world = None
         rotation_raw = None
-        if self.use_world_normal:
+        if use_extra_heads:
             depth = octree.depth
-            normal_raw = self.normal_head(feat, octree, depth)
-            rotation_raw = self.rotation_head(feat, octree, depth)
-            pred_normal_world = self.normal_act(normal_raw)
+            if self.use_normal_head:
+                normal_raw = self.normal_head(feat, octree, depth)
+                pred_normal_world = self.normal_act(normal_raw)
+            if self.use_rotation_head:
+                rotation_raw = self.rotation_head(feat, octree, depth)
 
         if self.opt.gaussian_loss:
             gaussian_loss = F.mse_loss(base_out, data['gaussian'])
-            base_denorm = base_out * self.gaussian_std_base + self.gaussian_mean_base
+            zeros = base_out.new_zeros([base_out.shape[0], 4])
+            x = torch.cat([base_out[:, :4], zeros, base_out[:, 4:]], dim=1)
+            x = x * self.gaussian_std + self.gaussian_mean
         else:
             gaussian_loss = torch.zeros(1, device = self.device)
-            base_denorm = base_out
-
-        if rotation_raw is None:
-            if self.opt.gaussian_loss:
-                rotation_raw = self.gaussian_rot_mean.unsqueeze(0).expand(base_out.shape[0], -1)
-            else:
-                rotation_raw = base_out.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(base_out.shape[0], -1)
-
-        x = torch.cat([base_denorm[:, :4], rotation_raw, base_denorm[:, 4:]], dim=1)
+            zeros = base_out.new_zeros([base_out.shape[0], 4])
+            x = torch.cat([base_out[:, :4], zeros, base_out[:, 4:]], dim=1)
+        if rotation_raw is not None:
+            x[:, 4:8] = rotation_raw
 
         pos = self.pos_act(octree.position) # [N, 3]
         opacity = self.opacity_act(x[:, :1]) # [N, 1]
@@ -318,13 +344,16 @@ class TexGaussian(nn.Module):
 
         loss = loss + loss_mse
 
-        if self.use_world_normal and pred_normal_world is not None:
+        if self.use_normal_head or self.use_rotation_head:
             normal_losses = self.compute_normal_losses(
                 gaussians, pred_normal_world, aligned_gt_mesh_normal, data, batch_id
             )
             loss_geo = normal_losses['normal_geo_loss']
             loss_tex = normal_losses['normal_tex_loss']
-            loss = loss + self.lambda_geo_normal * loss_geo + self.lambda_tex_normal * loss_tex
+            if self.use_rotation_head:
+                loss = loss + self.lambda_geo_normal * loss_geo
+            if self.use_normal_head and pred_normal_world is not None:
+                loss = loss + self.lambda_tex_normal * loss_tex
             results['normal_geo_loss'] = loss_geo.item()
             results['normal_tex_loss'] = loss_tex.item()
         else:
@@ -385,14 +414,14 @@ class TexGaussian(nn.Module):
         loss_geo = torch.zeros(1, device=device)
         loss_tex = torch.zeros(1, device=device)
 
-        if aligned_gt_mesh_normal is not None:
+        if self.use_rotation_head and aligned_gt_mesh_normal is not None:
             scales = gaussians[:, 4:7]
             quats = gaussians[:, 7:11]
             axis = self.get_shortest_axis(quats, scales)
             target = F.normalize(aligned_gt_mesh_normal, dim=-1, eps=1e-6)
             loss_geo = (1 - F.cosine_similarity(axis, target, dim=-1)).mean()
 
-        if 'gt_normal_map' in data:
+        if self.use_normal_head and pred_normal_world is not None and 'gt_normal_map' in data:
             normal_colors = (pred_normal_world * 0.5 + 0.5).clamp(0, 1)
             normal_gaussians = torch.cat([gaussians[:, :11], normal_colors], dim=-1)
             bg_color = torch.tensor([0.5, 0.5, 1.0], device=device, dtype=torch.float32)
