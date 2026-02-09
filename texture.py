@@ -143,6 +143,7 @@ class Converter(nn.Module):
         self.proj_matrix[2, 3] = 1
 
         self.gs_renderer = GaussianRenderer(opt)
+        self.enable_normal_head = str2bool(getattr(self.opt, "use_normal_head", "False"))
         
         if self.opt.force_cuda_rast:
             self.glctx = dr.RasterizeCudaContext()
@@ -347,7 +348,7 @@ class Converter(nn.Module):
             )
             self.mr_gaussians = None
 
-        if self.opt.use_world_normal and pred_normal_world is not None:
+        if self.enable_normal_head and pred_normal_world is not None:
             normal_colors = (pred_normal_world * 0.5 + 0.5).clamp(0, 1)
             self.normal_gaussians = torch.cat([self.gaussians[:, :11], normal_colors], dim=-1)
 
@@ -400,7 +401,7 @@ class Converter(nn.Module):
         if self.opt.use_material:
             self.mr_albedo = nn.Parameter(mr_albedo).to(self.device)
 
-        if self.opt.use_world_normal:
+        if self.enable_normal_head:
             normal_tex = torch.zeros(h * w, 3, device=self.device, dtype=torch.float32)
             normal_tex = normal_tex.view(h, w, -1)
             normal_tex[..., 0] = 0.5
@@ -417,7 +418,7 @@ class Converter(nn.Module):
             mr_optimizer = torch.optim.Adam([
                 {'params': self.mr_albedo, 'lr': 1e-3},
             ])
-        if self.opt.use_world_normal:
+        if self.enable_normal_head:
             normal_optimizer = torch.optim.Adam([
                 {'params': self.normal_tex, 'lr': 1e-2},
             ])
@@ -458,7 +459,7 @@ class Converter(nn.Module):
 
                 pbar.set_description(f"MSE = {loss_mse.item():.6f}")
 
-                if self.opt.use_world_normal and hasattr(self, "normal_gaussians"):
+                if self.enable_normal_head and hasattr(self, "normal_gaussians"):
                     normal_gt, _ = self.render_gs(pose, use_normal=True)
                     normal_pred, _ = self.render_mesh(pose, use_normal=True)
                     normal_loss = F.mse_loss(normal_pred, normal_gt)
@@ -498,7 +499,7 @@ class Converter(nn.Module):
 
             pbar.set_description(f"MSE = {loss_mse.item():.6f}")
 
-            if self.opt.use_world_normal and hasattr(self, "normal_gaussians"):
+            if self.enable_normal_head and hasattr(self, "normal_gaussians"):
                 normal_gt, _ = self.render_gs(pose, use_normal=True)
                 normal_pred, _ = self.render_mesh(pose, use_normal=True)
                 normal_loss = F.mse_loss(normal_pred, normal_gt)
@@ -508,7 +509,7 @@ class Converter(nn.Module):
         
         print(f"[INFO] finished fitting mesh albedo!")
 
-        if self.opt.use_world_normal and hasattr(self, "normal_tex"):
+        if self.enable_normal_head and hasattr(self, "normal_tex"):
             self.normal_world_map = torch.sigmoid(self.normal_tex).detach().clamp(0, 1).cpu().numpy()
     
         if self.opt.use_material:
@@ -1121,6 +1122,8 @@ if __name__ == "__main__":
     opt.use_text = str2bool(opt.use_text)
     opt.save_image = str2bool(opt.save_image)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
+    opt.use_normal_head = str2bool(opt.use_normal_head)
+    opt.use_rotation_head = str2bool(opt.use_rotation_head)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
     opt.use_longclip = str2bool(opt.use_longclip)
 
