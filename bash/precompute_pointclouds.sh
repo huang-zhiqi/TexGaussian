@@ -14,8 +14,9 @@ OUTPUT_DIR="../datasets/texverse_pointcloud_npz"
 # Processing
 # =========================
 MAX_POINTS=200000
-MAX_SAMPLES=10     # -1 means all, 10 means only convert first 10 unique samples
+MAX_SAMPLES=-1     # -1 means all, 10 means only convert first 10 unique samples
 OVERWRITE="False"  # True | False
+LOG_INTERVAL=50
 
 echo "[INFO] Pointcloud precompute config"
 echo "  Train TSV: ${TRAIN_TSV}"
@@ -23,6 +24,7 @@ echo "  Test TSV:  ${TEST_TSV}"
 echo "  Output:    ${OUTPUT_DIR}"
 echo "  MaxPoints: ${MAX_POINTS}"
 echo "  MaxSamples:${MAX_SAMPLES}"
+echo "  LogIntvl:  ${LOG_INTERVAL}"
 echo "  Overwrite: ${OVERWRITE}"
 
 if [[ ! -f "${TRAIN_TSV}" ]]; then
@@ -42,6 +44,7 @@ ARGS=(
   --output_dir "${OUTPUT_DIR}"
   --max_points "${MAX_POINTS}"
   --max_samples "${MAX_SAMPLES}"
+  --log_interval "${LOG_INTERVAL}"
 )
 
 if [[ "${OVERWRITE}" == "True" ]]; then

@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--center_tol",
         type=float,
-        default=0.10,
+        default=0.05,
         help="Tolerance for bbox-center abs max component, where bbox-center=(min+max)/2.",
     )
     parser.add_argument(

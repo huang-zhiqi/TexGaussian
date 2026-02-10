@@ -4,6 +4,7 @@ import csv
 import hashlib
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -276,7 +277,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Stop immediately on first failed sample.",
     )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=50,
+        help="Print progress every N processed samples. <=0 disables interval logs.",
+    )
     return parser.parse_args()
+
+
+def format_seconds(sec: float) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def print_progress(
+    idx: int,
+    total: int,
+    created: int,
+    skipped: int,
+    failed: int,
+    t0: float,
+) -> None:
+    elapsed = time.time() - t0
+    speed = idx / max(elapsed, 1e-6)
+    eta = (total - idx) / max(speed, 1e-6)
+    print(
+        f"[INFO] {idx}/{total} ({idx / max(total, 1) * 100:.1f}%) "
+        f"created={created} skipped={skipped} failed={failed} "
+        f"elapsed={format_seconds(elapsed)} eta={format_seconds(eta)} "
+        f"speed={speed:.2f}/s"
+    )
 
 
 def main() -> int:
@@ -320,18 +356,20 @@ def main() -> int:
         print("[INFO] Limit samples: all")
     print(f"[INFO] Output directory: {output_dir}")
     print(f"[INFO] Max points: {args.max_points}")
+    print(f"[INFO] Log interval: {args.log_interval}")
 
     created = 0
     skipped = 0
     failed = 0
     failures: List[Tuple[str, str, str]] = []
+    t0 = time.time()
 
     for idx, job in enumerate(jobs, start=1):
         out_path = os.path.join(output_dir, job.uid + ".npz")
         if os.path.isfile(out_path) and not args.overwrite:
             skipped += 1
-            if idx % 200 == 0 or idx == total:
-                print(f"[INFO] {idx}/{total} created={created} skipped={skipped} failed={failed}")
+            if idx == total or (args.log_interval > 0 and idx % args.log_interval == 0):
+                print_progress(idx, total, created, skipped, failed, t0)
             continue
 
         if not job.mesh_path or not os.path.isfile(job.mesh_path):
@@ -356,8 +394,8 @@ def main() -> int:
             if args.fail_fast:
                 break
 
-        if idx % 200 == 0 or idx == total:
-            print(f"[INFO] {idx}/{total} created={created} skipped={skipped} failed={failed}")
+        if idx == total or (args.log_interval > 0 and idx % args.log_interval == 0):
+            print_progress(idx, total, created, skipped, failed, t0)
 
     fail_path = os.path.join(output_dir, "precompute_failures.tsv")
     if failures:
@@ -367,9 +405,11 @@ def main() -> int:
             writer.writerows(failures)
         print(f"[INFO] Wrote failures to: {fail_path}")
 
+    elapsed = time.time() - t0
     print(
         "[INFO] Done. "
-        f"total={total}, created={created}, skipped={skipped}, failed={failed}"
+        f"total={total}, created={created}, skipped={skipped}, failed={failed}, "
+        f"elapsed={format_seconds(elapsed)}"
     )
     return 0 if failed == 0 else 2
 
