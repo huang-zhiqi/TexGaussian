@@ -80,6 +80,8 @@ class TexGaussian(nn.Module):
             self.use_rotation_head = self.use_rotation_head.lower() in ('yes', 'true', 't', 'y', '1')
         self.lambda_geo_normal = self.opt.lambda_geo_normal
         self.lambda_tex_normal = self.opt.lambda_tex_normal
+        self.normal_residual_scale = 0.05
+        self.rotation_residual_scale = 0.05
 
         if self.opt.use_material:
             self.opt.out_channels += 3
@@ -126,12 +128,14 @@ class TexGaussian(nn.Module):
                 self.normal_head = ocnn.nn.OctreeConv(
                     normal_in, 3, kernel_size=[3], nempty=True, use_bias=True
                 )
-                self._init_head(self.normal_head, bias_value=[0.0, 0.0, 1.0])
+                self._init_head(self.normal_head)
             if self.use_rotation_head:
                 self.rotation_head = ocnn.nn.OctreeConv(
                     normal_in, 4, kernel_size=[3], nempty=True, use_bias=True
                 )
-                self._init_head(self.rotation_head, bias_value=[1.0, 0.0, 0.0, 0.0])
+                self._init_head(self.rotation_head)
+
+        self.register_buffer("quat_identity", torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32))
 
         # Gaussian Renderer
         self.gs = GaussianRenderer(opt)
@@ -175,7 +179,7 @@ class TexGaussian(nn.Module):
     def _init_head(self, head, bias_value=None):
         for _, p in head.named_parameters():
             if p.dim() > 1:
-                nn.init.normal_(p, mean=0.0, std=1e-4)
+                nn.init.zeros_(p)
             else:
                 nn.init.zeros_(p)
         if bias_value is not None:
@@ -186,21 +190,64 @@ class TexGaussian(nn.Module):
                     p.data.copy_(bias_tensor)
                     break
 
+    def quat_multiply(self, q1, q2):
+        r1, x1, y1, z1 = q1.unbind(dim=-1)
+        r2, x2, y2, z2 = q2.unbind(dim=-1)
+        return torch.stack([
+            r1 * r2 - x1 * x2 - y1 * y2 - z1 * z2,
+            r1 * x2 + x1 * r2 + y1 * z2 - z1 * y2,
+            r1 * y2 - x1 * z2 + y1 * r2 + z1 * x2,
+            r1 * z2 + x1 * y2 - y1 * x2 + z1 * r2,
+        ], dim=-1)
+
+    def quat_from_two_vectors(self, src, dst):
+        src = F.normalize(src, dim=-1, eps=1e-6)
+        dst = F.normalize(dst, dim=-1, eps=1e-6)
+
+        cross = torch.cross(src, dst, dim=-1)
+        dot = (src * dst).sum(dim=-1, keepdim=True)
+        w = 1.0 + dot
+        quat = torch.cat([w, cross], dim=-1)
+
+        opposite = (w.squeeze(-1) < 1e-6)
+        if opposite.any():
+            ref = torch.zeros_like(src)
+            ref[:, 0] = 1.0
+            use_y = src[:, 0].abs() > 0.9
+            ref[use_y, 0] = 0.0
+            ref[use_y, 1] = 1.0
+            ortho = torch.cross(src, ref, dim=-1)
+            ortho = F.normalize(ortho, dim=-1, eps=1e-6)
+            quat_opposite = torch.cat([torch.zeros_like(w), ortho], dim=-1)
+            quat = torch.where(opposite.unsqueeze(-1), quat_opposite, quat)
+
+        return F.normalize(quat, dim=-1, eps=1e-6)
+
+    def normal_to_shortest_axis_quat(self, normals, scales):
+        shortest_idx = torch.argmin(scales, dim=-1)
+        axis_table = torch.eye(3, device=normals.device, dtype=normals.dtype)
+        src_axis = axis_table[shortest_idx]
+        return self.quat_from_two_vectors(src_axis, normals)
+
     def forward_gaussians(self, x, octree, condition = None, data = None, ema = False):
         # x: [N, 4]
         # return: Gaussians: [N, dim_t]
+        input_feature = x
+        mesh_normal_prior = None
+        if input_feature.shape[1] >= 3:
+            mesh_normal_prior = F.normalize(input_feature[:, :3], dim=-1, eps=1e-6)
 
         use_extra_heads = self.use_normal_head or self.use_rotation_head
         if ema:
             if use_extra_heads:
-                base_out, feat = self.ema_model(x, octree, condition, return_features=True)
+                base_out, feat = self.ema_model(input_feature, octree, condition, return_features=True)
             else:
-                base_out = self.ema_model(x, octree, condition)
+                base_out = self.ema_model(input_feature, octree, condition)
         else:
             if use_extra_heads:
-                base_out, feat = self.model(x, octree, condition, return_features=True)
+                base_out, feat = self.model(input_feature, octree, condition, return_features=True)
             else:
-                base_out = self.model(x, octree, condition) # [N, out_channels]
+                base_out = self.model(input_feature, octree, condition) # [N, out_channels]
 
         pred_normal_world = None
         rotation_raw = None
@@ -208,29 +255,45 @@ class TexGaussian(nn.Module):
             depth = octree.depth
             if self.use_normal_head:
                 normal_raw = self.normal_head(feat, octree, depth)
-                pred_normal_world = self.normal_act(normal_raw)
+                if mesh_normal_prior is not None:
+                    pred_normal_world = self.normal_act(
+                        mesh_normal_prior + self.normal_residual_scale * normal_raw
+                    )
+                else:
+                    pred_normal_world = self.normal_act(normal_raw)
             if self.use_rotation_head:
                 rotation_raw = self.rotation_head(feat, octree, depth)
 
         if self.opt.gaussian_loss:
             gaussian_loss = F.mse_loss(base_out, data['gaussian'])
             zeros = base_out.new_zeros([base_out.shape[0], 4])
-            x = torch.cat([base_out[:, :4], zeros, base_out[:, 4:]], dim=1)
-            x = x * self.gaussian_std + self.gaussian_mean
+            gaussian_params = torch.cat([base_out[:, :4], zeros, base_out[:, 4:]], dim=1)
+            gaussian_params = gaussian_params * self.gaussian_std + self.gaussian_mean
         else:
             gaussian_loss = torch.zeros(1, device = self.device)
             zeros = base_out.new_zeros([base_out.shape[0], 4])
-            x = torch.cat([base_out[:, :4], zeros, base_out[:, 4:]], dim=1)
+            gaussian_params = torch.cat([base_out[:, :4], zeros, base_out[:, 4:]], dim=1)
         if rotation_raw is not None:
-            x[:, 4:8] = rotation_raw
+            if mesh_normal_prior is not None:
+                scales_prior = self.scale_act(gaussian_params[:, 1:4])
+                base_quat = self.normal_to_shortest_axis_quat(mesh_normal_prior, scales_prior)
+                quat_identity = self.quat_identity.unsqueeze(0).to(
+                    device=rotation_raw.device, dtype=rotation_raw.dtype
+                )
+                delta_quat = self.rot_act(
+                    self.rotation_residual_scale * rotation_raw + quat_identity
+                )
+                gaussian_params[:, 4:8] = self.quat_multiply(delta_quat, base_quat)
+            else:
+                gaussian_params[:, 4:8] = rotation_raw
 
         pos = self.pos_act(octree.position) # [N, 3]
-        opacity = self.opacity_act(x[:, :1]) # [N, 1]
-        scale = self.scale_act(x[:, 1:4]) # [N, 3]
-        rotation = self.rot_act(x[:, 4:8]) # [N, 4]
-        rgbs = self.rgb_act(x[:, 8:11]) # [N, 3]
+        opacity = self.opacity_act(gaussian_params[:, :1]) # [N, 1]
+        scale = self.scale_act(gaussian_params[:, 1:4]) # [N, 3]
+        rotation = self.rot_act(gaussian_params[:, 4:8]) # [N, 4]
+        rgbs = self.rgb_act(gaussian_params[:, 8:11]) # [N, 3]
         if self.opt.use_material:
-            mr = self.mr_act(x[:, 11:14]) # [N, 3]
+            mr = self.mr_act(gaussian_params[:, 11:14]) # [N, 3]
 
         gaussians = torch.cat([pos, opacity, scale, rotation, rgbs], dim=-1) # [N, 14]
         if self.opt.use_material:

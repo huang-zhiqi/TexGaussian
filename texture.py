@@ -189,6 +189,33 @@ class Converter(nn.Module):
         distances = np.linalg.norm(self.mesh.vertices, axis=1)
         self.mesh.vertices /= np.max(distances)
 
+    @staticmethod
+    def _interpolate_vertex_normals(points, tri_verts, tri_normals):
+        v0 = tri_verts[:, 0]
+        v1 = tri_verts[:, 1]
+        v2 = tri_verts[:, 2]
+        e0 = v1 - v0
+        e1 = v2 - v0
+        vp = points - v0
+
+        d00 = np.sum(e0 * e0, axis=1)
+        d01 = np.sum(e0 * e1, axis=1)
+        d11 = np.sum(e1 * e1, axis=1)
+        d20 = np.sum(vp * e0, axis=1)
+        d21 = np.sum(vp * e1, axis=1)
+        denom = d00 * d11 - d01 * d01
+        denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+
+        w1 = (d11 * d20 - d01 * d21) / denom
+        w2 = (d00 * d21 - d01 * d20) / denom
+        w0 = 1.0 - w1 - w2
+        bary = np.stack([w0, w1, w2], axis=1)
+
+        normals = np.sum(tri_normals * bary[..., None], axis=1)
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        norms = np.where(norms < 1e-12, 1e-12, norms)
+        return normals / norms
+
     def set_text_prompt(self, text_prompt: str):
         """Update text prompt and re-encode embedding.
         
@@ -227,7 +254,9 @@ class Converter(nn.Module):
         self.normalize_mesh()
 
         point, idx = trimesh.sample.sample_surface(self.mesh, num_samples)
-        normals = self.mesh.face_normals[idx]
+        tri_verts = self.mesh.vertices[self.mesh.faces[idx]]
+        vertex_normals = self.mesh.vertex_normals[self.mesh.faces[idx]]
+        normals = self._interpolate_vertex_normals(point, tri_verts, vertex_normals)
         
         points_gt = Points(points = torch.from_numpy(point).float(), normals = torch.from_numpy(normals).float())
         points_gt.clip(min=-1, max=1)
@@ -402,12 +431,16 @@ class Converter(nn.Module):
             self.mr_albedo = nn.Parameter(mr_albedo).to(self.device)
 
         if self.enable_normal_head:
-            normal_tex = torch.zeros(h * w, 3, device=self.device, dtype=torch.float32)
-            normal_tex = normal_tex.view(h, w, -1)
-            normal_tex[..., 0] = 0.5
-            normal_tex[..., 1] = 0.5
-            normal_tex[..., 2] = 1.0
+            if getattr(mesh, "vn", None) is not None and mesh.vn.shape[0] == mesh.v.shape[0]:
+                vn = F.normalize(mesh.vn, dim=-1, eps=1e-6)
+            else:
+                mesh.auto_normal()
+                vn = F.normalize(mesh.vn, dim=-1, eps=1e-6)
+            normal_tex, _ = dr.interpolate(vn.unsqueeze(0), rast, mesh.f)
+            normal_tex = normal_tex.squeeze(0)
+            normal_tex = (normal_tex * 0.5 + 0.5).clamp(0, 1)
             normal_tex = uv_padding(normal_tex, mask, padding)
+            normal_tex = torch.logit(normal_tex.clamp(1e-4, 1 - 1e-4))
             self.normal_tex = nn.Parameter(normal_tex).to(self.device)
         
         optimizer = torch.optim.Adam([

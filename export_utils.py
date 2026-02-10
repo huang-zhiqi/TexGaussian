@@ -121,7 +121,8 @@ def compute_vertex_tangents(
     tan = F.normalize(tan, dim=-1, eps=1e-6)
     bitan = F.normalize(bitan, dim=-1, eps=1e-6)
     handed = torch.sign((torch.cross(nrm, tan, dim=-1) * bitan).sum(dim=-1, keepdim=True))
-    bitan = torch.cross(nrm, tan, dim=-1) * handed
+    handed = torch.where(handed == 0, torch.ones_like(handed), handed)
+    bitan = F.normalize(torch.cross(nrm, tan, dim=-1) * handed, dim=-1, eps=1e-6)
 
     return tan, bitan, nrm
 
@@ -177,8 +178,14 @@ def save_normal_map(mesh, pred_world_normal_map, save_path, flip_green=False):
     n_map = F.normalize(n_map.squeeze(0), dim=-1, eps=1e-6)
     mask = mask.squeeze(0)
 
-    tbn = torch.stack([t_map, b_map, n_map], dim=-1)  # [H, W, 3, 3]
-    n_tan = torch.matmul(normal.unsqueeze(-2), tbn).squeeze(-2)
+    n_tan = torch.stack(
+        [
+            (normal * t_map).sum(dim=-1),
+            (normal * b_map).sum(dim=-1),
+            (normal * n_map).sum(dim=-1),
+        ],
+        dim=-1,
+    )
     n_tan = F.normalize(n_tan, dim=-1, eps=1e-6)
     if flip_green:
         n_tan[..., 1] = -n_tan[..., 1]
