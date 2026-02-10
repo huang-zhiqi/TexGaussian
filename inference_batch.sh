@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="normal_roration_residual_mini"
+EXP_NAME="normal_rotation_residual_mini"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
