@@ -147,7 +147,7 @@ class TexGaussian(nn.Module):
         self.rot_act = lambda x: F.normalize(x, dim=-1)
         self.rgb_act = lambda x: torch.sigmoid(x)   # [0, 1]
         if self.opt.use_material:
-            self.mr_act = lambda x: torch.sigmoid(x)
+            self.material_act = lambda x: torch.sigmoid(x)
         if self.use_normal_head:
             self.normal_act = lambda x: F.normalize(x, dim=-1)
 
@@ -293,12 +293,12 @@ class TexGaussian(nn.Module):
         rotation = self.rot_act(gaussian_params[:, 4:8]) # [N, 4]
         rgbs = self.rgb_act(gaussian_params[:, 8:11]) # [N, 3]
         if self.opt.use_material:
-            mr = self.mr_act(gaussian_params[:, 11:14]) # [N, 3]
+            material = self.material_act(gaussian_params[:, 11:14]) # [N, 3]
 
         gaussians = torch.cat([pos, opacity, scale, rotation, rgbs], dim=-1) # [N, 14]
         if self.opt.use_material:
-            mr_gaussians = torch.cat([pos, opacity, scale, rotation, mr], dim=-1) # [N, 14]
-            return gaussian_loss, gaussians, mr_gaussians, pred_normal_world
+            material_gaussians = torch.cat([pos, opacity, scale, rotation, material], dim=-1) # [N, 14]
+            return gaussian_loss, gaussians, material_gaussians, pred_normal_world
 
         else:
             return gaussian_loss, gaussians, None, pred_normal_world
@@ -355,7 +355,7 @@ class TexGaussian(nn.Module):
         aligned_gt_mesh_normal = None
         if input_feature.shape[1] >= 3:
             aligned_gt_mesh_normal = input_feature[:, :3]
-        gaussian_loss, gaussians, mr_gaussians, pred_normal_world = self.forward_gaussians(
+        gaussian_loss, gaussians, material_gaussians, pred_normal_world = self.forward_gaussians(
             input_feature, octree, condition, data, ema = ema) # [N, 14]
         batch_id = octree.batch_id(self.opt.input_depth, nempty = True)
 
@@ -370,38 +370,45 @@ class TexGaussian(nn.Module):
         pred_alphas = results['alpha'] # [B, V, 1, output_size, output_size]
 
         if self.opt.use_material:
-            mr_results = self.gs.render(mr_gaussians, batch_id, data['cam_view'], data['cam_view_proj'], data['cam_pos'], bg_color=bg_color)
-            mr_pred_images = mr_results['image']
+            material_bg = torch.zeros(3, dtype=torch.float32, device=gaussians.device)
+            material_results = self.gs.render(
+                material_gaussians, batch_id, data['cam_view'], data['cam_view_proj'], data['cam_pos'], bg_color=material_bg
+            )
+            material_pred_images = material_results['image']  # [B, V, 3, H, W]
+            rough_pred = material_pred_images[:, :, 0:1, ...]
+            metal_pred = material_pred_images[:, :, 1:2, ...]
 
         results['images_pred'] = pred_images
         if self.opt.use_material:
-            results['mr_images_pred'] = mr_pred_images
+            results['rough_images_pred'] = rough_pred
+            results['metallic_images_pred'] = metal_pred
         results['alphas_pred'] = pred_alphas
 
         gt_images = data['images_output'] # [B, V, 3, output_size, output_size], ground-truth novel views
         if self.opt.use_material:
-            mr_gt_images = data['mr_images_output']
+            rough_gt = data['rough_images_output']  # [B, V, 1, H, W]
+            metal_gt = data['metallic_images_output']  # [B, V, 1, H, W]
         gt_masks = data['masks_output'] # [B, V, 1, output_size, output_size], ground-truth masks
 
         gt_images = gt_images * gt_masks + bg_color.view(1, 1, 3, 1, 1) * (1 - gt_masks)  # [B, V, 3, output_size, output_size]
-        if self.opt.use_material:
-            mr_gt_images = mr_gt_images * gt_masks + bg_color.view(1, 1, 3, 1, 1) * (1 - gt_masks)
 
         albedo_loss = F.mse_loss(pred_images, gt_images)
         if self.opt.use_material:
-            mr_loss = F.mse_loss(mr_pred_images, mr_gt_images)
+            rough_loss = ((rough_pred - rough_gt) ** 2 * gt_masks).sum() / (gt_masks.sum() + 1e-6)
+            metal_loss = ((metal_pred - metal_gt) ** 2 * gt_masks).sum() / (gt_masks.sum() + 1e-6)
 
         mask_loss = F.mse_loss(pred_alphas, gt_masks)
 
         if self.opt.use_material:
-            loss_mse = albedo_loss + mr_loss + mask_loss
+            loss_mse = albedo_loss + rough_loss + metal_loss + mask_loss
 
         else:
             loss_mse = albedo_loss + mask_loss
 
         results['albedo_loss'] = albedo_loss.item()
         if self.opt.use_material:
-            results['mr_loss'] = mr_loss.item()
+            results['roughness_loss'] = rough_loss.item()
+            results['metallic_loss'] = metal_loss.item()
         results['mask_loss'] = mask_loss.item()
         results['gaussian_loss'] = gaussian_loss.item()
 
@@ -423,23 +430,15 @@ class TexGaussian(nn.Module):
             results['normal_geo_loss'] = 0.0
             results['normal_tex_loss'] = 0.0
 
+        loss_lpips = torch.zeros(1, device=gaussians.device)
         if self.opt.lambda_lpips > 0:
             loss_lpips = self.lpips_loss(
                 F.interpolate(gt_images.view(-1, 3, self.opt.output_size, self.opt.output_size) * 2 - 1, (256, 256), mode='bilinear', align_corners=False),
                 F.interpolate(pred_images.view(-1, 3, self.opt.output_size, self.opt.output_size) * 2 - 1, (256, 256), mode='bilinear', align_corners=False),
             ).mean()
             loss = loss + self.opt.lambda_lpips * loss_lpips
-            if self.opt.use_material:
-                mr_loss_lpips = self.lpips_loss(
-                    F.interpolate(mr_gt_images.view(-1, 3, self.opt.output_size, self.opt.output_size) * 2 - 1, (256, 256), mode='bilinear', align_corners=False),
-                    F.interpolate(mr_pred_images.view(-1, 3, self.opt.output_size, self.opt.output_size) * 2 - 1, (256, 256), mode='bilinear', align_corners=False),
-                ).mean()
-                loss = loss + self.opt.lambda_lpips * mr_loss_lpips
 
         results['lpips_loss'] = self.opt.lambda_lpips * loss_lpips.item()
-
-        if self.opt.use_material:
-            results['mr_lpips_loss'] = self.opt.lambda_lpips * mr_loss_lpips.item()
 
         results['loss'] = loss
 
@@ -449,8 +448,10 @@ class TexGaussian(nn.Module):
             results['psnr'] = psnr
 
             if self.opt.use_material:
-                mr_psnr = -10 * torch.log10(torch.mean((mr_pred_images.detach() - mr_gt_images) ** 2))
-                results['mr_psnr'] = mr_psnr
+                rough_psnr = -10 * torch.log10(torch.mean((rough_pred.detach() - rough_gt) ** 2) + 1e-8)
+                metal_psnr = -10 * torch.log10(torch.mean((metal_pred.detach() - metal_gt) ** 2) + 1e-8)
+                results['roughness_psnr'] = rough_psnr
+                results['metallic_psnr'] = metal_psnr
 
         del octree
 

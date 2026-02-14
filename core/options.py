@@ -62,6 +62,7 @@ class Options:
     trainlist: str = 'pbr_train_list.txt'
     testlist: str = 'pbr_train_list.txt'
     image_dir: str = 'path_to_image_dir'
+    test_image_dir: str = ''
     pointcloud_dir: str = 'path_to_pointcloud_dir'
     gaussian_dir: str = 'path_to_fitted_gaussian'
 

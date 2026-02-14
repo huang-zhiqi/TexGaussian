@@ -3,6 +3,7 @@ import time
 import random
 import os
 import argparse
+import numpy as np
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -85,11 +86,57 @@ def main():
             ckpt = torch.load(opt.resume, map_location='cpu')
 
         accelerator.print('Start loading checkpoint')
-        incompatible = model.load_state_dict(ckpt, strict=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            ckpt = ckpt["state_dict"]
+
+        model_state = model.state_dict()
+        filtered_ckpt = {}
+        skipped_text = []
+        skipped_shape = []
+        skipped_nontensor = 0
+        unexpected_keys = []
+
+        skip_text_encoder = opt.use_text and opt.use_longclip
+
+        for k, v in ckpt.items():
+            if not torch.is_tensor(v):
+                skipped_nontensor += 1
+                continue
+
+            key = k
+            if key not in model_state and key.startswith("module."):
+                key = key[len("module."):]
+
+            if key not in model_state:
+                unexpected_keys.append(k)
+                continue
+
+            if skip_text_encoder and key.startswith("text_encoder."):
+                skipped_text.append(key)
+                continue
+
+            if model_state[key].shape != v.shape:
+                skipped_shape.append((key, tuple(v.shape), tuple(model_state[key].shape)))
+                continue
+
+            filtered_ckpt[key] = v
+
+        incompatible = model.load_state_dict(filtered_ckpt, strict=False)
         if incompatible.missing_keys:
             accelerator.print(f"[WARN] missing keys: {len(incompatible.missing_keys)}")
         if incompatible.unexpected_keys:
             accelerator.print(f"[WARN] unexpected keys: {len(incompatible.unexpected_keys)}")
+        if unexpected_keys:
+            accelerator.print(f"[WARN] checkpoint keys not in model: {len(unexpected_keys)}")
+        if skipped_text:
+            accelerator.print(f"[INFO] skipped text encoder keys for LongCLIP: {len(skipped_text)}")
+        if skipped_shape:
+            accelerator.print(f"[WARN] skipped shape-mismatch keys: {len(skipped_shape)}")
+            for name, src_shape, dst_shape in skipped_shape[:5]:
+                accelerator.print(f"  - {name}: ckpt{src_shape} vs model{dst_shape}")
+        if skipped_nontensor:
+            accelerator.print(f"[INFO] skipped non-tensor checkpoint entries: {skipped_nontensor}")
+        accelerator.print(f"[INFO] loaded checkpoint tensors: {len(filtered_ckpt)}")
         accelerator.print("Loaded base PBR weights. 'normal_head' (and 'rotation_head') weights were initialized freshly.")
 
     train_dataset = Dataset(opt, training=True)
@@ -97,7 +144,7 @@ def main():
         train_dataset,
         batch_size=opt.batch_size,
         shuffle=True,
-        num_workers=opt.batch_size,
+        num_workers=opt.num_workers,
         collate_fn=collate_func,
         pin_memory=True,
         drop_last=True,
@@ -114,8 +161,22 @@ def main():
         drop_last=False,
     )
 
+    if len(train_dataloader) == 0:
+        raise RuntimeError(
+            "Training dataloader is empty. Check train.tsv, image_dir, pointcloud_dir, "
+            "and reduce batch_size or disable drop_last."
+        )
+    if len(test_dataloader) == 0:
+        raise RuntimeError(
+            "Test dataloader is empty. Check test.tsv, image_dir, and pointcloud_dir."
+        )
+
     # optimizer
-    if (opt.use_normal_head or opt.use_rotation_head) and (hasattr(model, "normal_head") or hasattr(model, "rotation_head")):
+    use_head_lr_split = (
+        (opt.use_normal_head or opt.use_rotation_head)
+        and (hasattr(model, "normal_head") or hasattr(model, "rotation_head"))
+    )
+    if use_head_lr_split:
         head_params = []
         if hasattr(model, "normal_head"):
             head_params += list(model.normal_head.parameters())
@@ -140,8 +201,17 @@ def main():
         )
 
     total_steps = opt.num_epochs * len(train_dataloader)
-    pct_start = 3000 / total_steps
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=opt.lr, total_steps=total_steps, pct_start=pct_start)
+    pct_start = min(0.3, max(0.01, 3000.0 / max(1, total_steps)))
+    if use_head_lr_split:
+        max_lr = [opt.lr * 0.1, opt.lr]
+    else:
+        max_lr = opt.lr
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        total_steps=max(1, total_steps),
+        pct_start=pct_start,
+    )
 
     model, optimizer, train_dataloader, test_dataloader, scheduler = accelerator.prepare(   # prepare函数会自动把模型、优化器、训练集和测试集都加载到gpu上，不用手动移动了。
         model, optimizer, train_dataloader, test_dataloader, scheduler
@@ -171,7 +241,8 @@ def main():
         total_loss = 0
         total_psnr = 0
         if opt.use_material:
-            mr_total_psnr = 0
+            rough_total_psnr = 0
+            metallic_total_psnr = 0
         for i, data in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
@@ -188,9 +259,10 @@ def main():
                 normal_tex_loss = out.get('normal_tex_loss', 0.0)
 
                 if opt.use_material:
-                    mr_loss = out['mr_loss']
-                    mr_lpips_loss = out['mr_lpips_loss']
-                    mr_psnr = out['mr_psnr']
+                    rough_loss = out['roughness_loss']
+                    metallic_loss = out['metallic_loss']
+                    rough_psnr = out['roughness_psnr']
+                    metallic_psnr = out['metallic_psnr']
 
                 accelerator.backward(loss)
 
@@ -200,13 +272,14 @@ def main():
 
                 optimizer.step()
                 scheduler.step()
-                model.module.update_EMA()
+                accelerator.unwrap_model(model).update_EMA()
 
                 total_loss += loss.detach()
                 total_psnr += psnr.detach()
 
                 if opt.use_material:
-                    mr_total_psnr += mr_psnr.detach()
+                    rough_total_psnr += rough_psnr.detach()
+                    metallic_total_psnr += metallic_psnr.detach()
 
                 torch.cuda.empty_cache()
 
@@ -223,8 +296,8 @@ def main():
                     if opt.use_material:
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} loss: {loss.item():.6f} \
-gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} mr_loss: {mr_loss:.6f} \
-mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} mr_lpips_loss: {mr_lpips_loss:.6f} \
+gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} roughness_loss: {rough_loss:.6f} \
+metallic_loss: {metallic_loss:.6f} mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} \
 normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} time: {t:.3f}")
 
                     else:
@@ -247,9 +320,10 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                         writer.add_scalar('normal_tex_loss', out['normal_tex_loss'], epoch * len(train_dataloader) + i)
 
                     if opt.use_material:
-                        writer.add_scalar('mr_loss', out['mr_loss'], epoch * len(train_dataloader) + i)
-                        writer.add_scalar('mr_lpips_loss', out['mr_lpips_loss'], epoch * len(train_dataloader) + i)
-                        writer.add_scalar('mr_psnr', out['mr_psnr'], epoch * len(train_dataloader) + i)        
+                        writer.add_scalar('roughness_loss', out['roughness_loss'], epoch * len(train_dataloader) + i)
+                        writer.add_scalar('metallic_loss', out['metallic_loss'], epoch * len(train_dataloader) + i)
+                        writer.add_scalar('roughness_psnr', out['roughness_psnr'], epoch * len(train_dataloader) + i)
+                        writer.add_scalar('metallic_psnr', out['metallic_psnr'], epoch * len(train_dataloader) + i)
 
                 # save log images
                 if i % opt.image_interval == 0:
@@ -267,14 +341,21 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                         kiui.write_image(f'{opt.pred_image_dir}/{epoch}_{i}.jpg', pred_images)
 
                     if opt.use_material:
-                        mr_pred_images = out['mr_images_pred']
-                        mr_pred_images = mr_pred_images.detach().cpu().numpy()
-                        mr_pred_images = mr_pred_images.transpose(0, 3, 1, 4, 2).reshape(-1, mr_pred_images.shape[1] * mr_pred_images.shape[3], 3)
-
+                        rough_pred = out['rough_images_pred'].detach().cpu().numpy()  # [B, V, 1, H, W]
+                        rough_pred = np.repeat(rough_pred, 3, axis=2)
+                        rough_pred = rough_pred.transpose(0, 3, 1, 4, 2).reshape(-1, rough_pred.shape[1] * rough_pred.shape[3], 3)
                         if opt.batch_size == 1:
-                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_mr_{uid[0]}.jpg', mr_pred_images)
+                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_rough_{uid[0]}.jpg', rough_pred)
                         else:
-                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_mr_{i}.jpg', mr_pred_images)
+                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_rough_{i}.jpg', rough_pred)
+
+                        metal_pred = out['metallic_images_pred'].detach().cpu().numpy()  # [B, V, 1, H, W]
+                        metal_pred = np.repeat(metal_pred, 3, axis=2)
+                        metal_pred = metal_pred.transpose(0, 3, 1, 4, 2).reshape(-1, metal_pred.shape[1] * metal_pred.shape[3], 3)
+                        if opt.batch_size == 1:
+                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_metal_{uid[0]}.jpg', metal_pred)
+                        else:
+                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_metal_{i}.jpg', metal_pred)
 
                     gt_images = data['images_output']
 
@@ -286,26 +367,37 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                         kiui.write_image(f'{opt.gt_image_dir}/{epoch}_{i}.jpg', gt_images)
 
                     if opt.use_material:
-                        mr_gt_images = data['mr_images_output']
-
-                        mr_gt_images = mr_gt_images.detach().cpu().numpy()
-                        mr_gt_images = mr_gt_images.transpose(0, 3, 1, 4, 2).reshape(-1, mr_gt_images.shape[1] * mr_gt_images.shape[3], 3)
-
+                        rough_gt_images = data['rough_images_output'].detach().cpu().numpy()
+                        rough_gt_images = np.repeat(rough_gt_images, 3, axis=2)
+                        rough_gt_images = rough_gt_images.transpose(0, 3, 1, 4, 2).reshape(-1, rough_gt_images.shape[1] * rough_gt_images.shape[3], 3)
                         if opt.batch_size == 1:
-                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_mr_{uid[0]}.jpg', mr_gt_images)
+                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_rough_{uid[0]}.jpg', rough_gt_images)
                         else:
-                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_mr_{i}.jpg', mr_gt_images)
+                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_rough_{i}.jpg', rough_gt_images)
+
+                        metal_gt_images = data['metallic_images_output'].detach().cpu().numpy()
+                        metal_gt_images = np.repeat(metal_gt_images, 3, axis=2)
+                        metal_gt_images = metal_gt_images.transpose(0, 3, 1, 4, 2).reshape(-1, metal_gt_images.shape[1] * metal_gt_images.shape[3], 3)
+                        if opt.batch_size == 1:
+                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_metal_{uid[0]}.jpg', metal_gt_images)
+                        else:
+                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_metal_{i}.jpg', metal_gt_images)
 
         total_loss = accelerator.gather_for_metrics(total_loss).mean()
         total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
         if opt.use_material:
-            mr_total_psnr = accelerator.gather_for_metrics(mr_total_psnr).mean()
+            rough_total_psnr = accelerator.gather_for_metrics(rough_total_psnr).mean()
+            metallic_total_psnr = accelerator.gather_for_metrics(metallic_total_psnr).mean()
         if accelerator.is_main_process:
             total_loss /= len(train_dataloader)
             total_psnr /= len(train_dataloader)
             if opt.use_material:
-                mr_total_psnr /= len(train_dataloader)
-                accelerator.print(f"[train] epoch: {epoch} loss: {total_loss.item():.6f} psnr: {total_psnr.item():.4f} mr_psnr: {mr_total_psnr.item():.4f}")
+                rough_total_psnr /= len(train_dataloader)
+                metallic_total_psnr /= len(train_dataloader)
+                accelerator.print(
+                    f"[train] epoch: {epoch} loss: {total_loss.item():.6f} psnr: {total_psnr.item():.4f} "
+                    f"rough_psnr: {rough_total_psnr.item():.4f} metallic_psnr: {metallic_total_psnr.item():.4f}"
+                )
             else:
                 accelerator.print(f"[train] epoch: {epoch} loss: {total_loss.item():.6f} psnr: {total_psnr.item():.4f}")
 
@@ -316,7 +408,8 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
 
         total_psnr = 0
         if opt.use_material:
-            mr_total_psnr = 0
+            rough_total_psnr = 0
+            metallic_total_psnr = 0
 
         model.eval()
 
@@ -331,8 +424,10 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                 total_psnr += psnr.detach()
 
                 if opt.use_material:
-                    mr_psnr = out['mr_psnr']
-                    mr_total_psnr += mr_psnr.detach()
+                    rough_psnr = out['roughness_psnr']
+                    metallic_psnr = out['metallic_psnr']
+                    rough_total_psnr += rough_psnr.detach()
+                    metallic_total_psnr += metallic_psnr.detach()
 
                 # save some images
                 if accelerator.is_main_process:
@@ -350,26 +445,41 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                     kiui.write_image(f'{opt.workspace}/eval_pred_images/{epoch}_{uid[0]}.jpg', pred_images)
 
                     if opt.use_material:
-                        mr_gt_images = data['mr_images_output']
-                        mr_gt_images = mr_gt_images.detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                        mr_gt_images = mr_gt_images.transpose(0, 3, 1, 4, 2).reshape(-1, mr_gt_images.shape[1] * mr_gt_images.shape[3], 3) # [B*output_size, V*output_size, 3]
-                        kiui.write_image(f'{opt.workspace}/eval_gt_images/{epoch}_mr_{uid[0]}.jpg', mr_gt_images)
+                        rough_gt = data['rough_images_output'].detach().cpu().numpy()  # [B, V, 1, H, W]
+                        rough_gt = np.repeat(rough_gt, 3, axis=2)
+                        rough_gt = rough_gt.transpose(0, 3, 1, 4, 2).reshape(-1, rough_gt.shape[1] * rough_gt.shape[3], 3)
+                        kiui.write_image(f'{opt.workspace}/eval_gt_images/{epoch}_rough_{uid[0]}.jpg', rough_gt)
 
-                        mr_pred_images = out['mr_images_pred']
-                        mr_pred_images = mr_pred_images.detach().cpu().numpy() # [B, V, 3, output_size, output_size]
-                        mr_pred_images = mr_pred_images.transpose(0, 3, 1, 4, 2).reshape(-1, mr_pred_images.shape[1] * mr_pred_images.shape[3], 3)
-                        kiui.write_image(f'{opt.workspace}/eval_pred_images/{epoch}_mr_{uid[0]}.jpg', mr_pred_images)
+                        rough_pred = out['rough_images_pred'].detach().cpu().numpy()  # [B, V, 1, H, W]
+                        rough_pred = np.repeat(rough_pred, 3, axis=2)
+                        rough_pred = rough_pred.transpose(0, 3, 1, 4, 2).reshape(-1, rough_pred.shape[1] * rough_pred.shape[3], 3)
+                        kiui.write_image(f'{opt.workspace}/eval_pred_images/{epoch}_rough_{uid[0]}.jpg', rough_pred)
+
+                        metal_gt = data['metallic_images_output'].detach().cpu().numpy()
+                        metal_gt = np.repeat(metal_gt, 3, axis=2)
+                        metal_gt = metal_gt.transpose(0, 3, 1, 4, 2).reshape(-1, metal_gt.shape[1] * metal_gt.shape[3], 3)
+                        kiui.write_image(f'{opt.workspace}/eval_gt_images/{epoch}_metal_{uid[0]}.jpg', metal_gt)
+
+                        metal_pred = out['metallic_images_pred'].detach().cpu().numpy()
+                        metal_pred = np.repeat(metal_pred, 3, axis=2)
+                        metal_pred = metal_pred.transpose(0, 3, 1, 4, 2).reshape(-1, metal_pred.shape[1] * metal_pred.shape[3], 3)
+                        kiui.write_image(f'{opt.workspace}/eval_pred_images/{epoch}_metal_{uid[0]}.jpg', metal_pred)
 
                 torch.cuda.empty_cache()
 
         total_psnr = accelerator.gather_for_metrics(total_psnr).mean()
         if opt.use_material:
-            mr_total_psnr = accelerator.gather_for_metrics(mr_total_psnr).mean()
+            rough_total_psnr = accelerator.gather_for_metrics(rough_total_psnr).mean()
+            metallic_total_psnr = accelerator.gather_for_metrics(metallic_total_psnr).mean()
         if accelerator.is_main_process:
             total_psnr /= len(test_dataloader)
             if opt.use_material:
-                mr_total_psnr /= len(test_dataloader)
-                accelerator.print(f"[eval] epoch: {epoch} psnr: {total_psnr:.4f} mr_psnr: {mr_total_psnr:.4f}")
+                rough_total_psnr /= len(test_dataloader)
+                metallic_total_psnr /= len(test_dataloader)
+                accelerator.print(
+                    f"[eval] epoch: {epoch} psnr: {total_psnr:.4f} "
+                    f"rough_psnr: {rough_total_psnr:.4f} metallic_psnr: {metallic_total_psnr:.4f}"
+                )
             else:
                 accelerator.print(f"[eval] epoch: {epoch} psnr: {total_psnr:.4f}")
 
