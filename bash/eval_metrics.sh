@@ -46,7 +46,7 @@ set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
-EXPERIMENT_NAME="${1:-normal_mini}"
+EXPERIMENT_NAME="${1:-texverse_stage1_new_modules_v3}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered_test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
 # If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will combine all images

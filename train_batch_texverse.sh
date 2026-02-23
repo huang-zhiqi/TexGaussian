@@ -20,19 +20,20 @@ export LIBRARY_PATH="$CONDA_PREFIX/lib:${LIBRARY_PATH}"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 
 # =========================
-# Runtime
+# Runtime (根据你的显卡数量调整)
 # =========================
-GPU_IDS="0"
-NUM_GPUS=1
+# 选项: "0" (1卡), "0,1" (2卡), "0,1,2,3" (4卡)
+GPU_IDS="0,1"
+NUM_GPUS=2
 ACC_CONFIG="acc_configs/gpu${NUM_GPUS}.yaml"
 MAIN_PORT=8878
 
 # =========================
 # Experiment
 # =========================
-EXP_NAME="texverse_longclip_heads"
+EXP_NAME="texverse_ggca_v2"  # v2: 修复了 EMA 同步问题，禁用 TextAdapter
 WORKSPACE="../experiments/${EXP_NAME}"
-RESUME_CKPT="./assets/ckpts/PBR_model.safetensors"  # leave empty to train from scratch
+RESUME_CKPT="./assets/ckpts/PBR_model.safetensors"  # 加载预训练基础模型
 
 # =========================
 # Data
@@ -55,13 +56,17 @@ LONGCLIP_MODEL="third_party/Long-CLIP/checkpoints/longclip-L.pt"
 LONGCLIP_CONTEXT_LENGTH=248
 USE_NORMAL_HEAD="True"
 USE_ROTATION_HEAD="True"
+FREEZE_BASE="True"  # 冻结基础模型，只训练新增模块
+USE_GGCA="True"  # 启用 Geometry-Gated Cross-Attention
+USE_TEXT_ADAPTER="False"  # 暂时禁用，确保 albedo 不受影响（LongCLIP 特征已对齐）
 
 # =========================
-# Optimization
+# Optimization (2卡3090优化配置)
 # =========================
+# 有效batch = BATCH_SIZE * NUM_GPUS * GRAD_ACC = 1 * 2 * 8 = 16
 BATCH_SIZE=1
 GRAD_ACC=8
-NUM_EPOCHS=1
+NUM_EPOCHS=1  # 冻结训练通常1个epoch足够
 LR=4e-4
 MIXED_PRECISION="bf16"
 LAMBDA_GEO_NORMAL=1.0
@@ -74,6 +79,9 @@ echo "  Workspace: ${WORKSPACE}"
 echo "  Resume: ${RESUME_CKPT}"
 echo "  LongCLIP: ${USE_LONGCLIP} (${LONGCLIP_MODEL})"
 echo "  Heads: normal=${USE_NORMAL_HEAD}, rotation=${USE_ROTATION_HEAD}"
+echo "  GGCA: ${USE_GGCA}"
+echo "  Text Adapter: ${USE_TEXT_ADAPTER}"
+echo "  Freeze base: ${FREEZE_BASE}"
 echo "  Train list: ${TRAIN_LIST}"
 echo "  Test list: ${TEST_LIST}"
 echo "  Caption field: ${CAPTION_FIELD}"
@@ -257,6 +265,9 @@ ARGS=(
   --longclip_context_length "${LONGCLIP_CONTEXT_LENGTH}"
   --use_normal_head "${USE_NORMAL_HEAD}"
   --use_rotation_head "${USE_ROTATION_HEAD}"
+  --use_ggca "${USE_GGCA}"
+  --use_text_adapter "${USE_TEXT_ADAPTER}"
+  --freeze_base "${FREEZE_BASE}"
   --lambda_geo_normal "${LAMBDA_GEO_NORMAL}"
   --lambda_tex_normal "${LAMBDA_TEX_NORMAL}"
 )

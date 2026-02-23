@@ -20,13 +20,21 @@ class GaussianRenderer:
         self.bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
 
         # intrinsics
-        self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.opt.fovy))
         self.proj_matrix = torch.zeros(4, 4, dtype=torch.float32)
+        self._update_fov_cache()
+
+    def _update_fov_cache(self):
+        """Recompute cached tan_half_fov and proj_matrix from current opt.fovy."""
+        self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.opt.fovy))
         self.proj_matrix[0, 0] = 1 / self.tan_half_fov
         self.proj_matrix[1, 1] = 1 / self.tan_half_fov
-        self.proj_matrix[2, 2] = (opt.zfar + opt.znear) / (opt.zfar - opt.znear)
-        self.proj_matrix[3, 2] = - (opt.zfar * opt.znear) / (opt.zfar - opt.znear)
+        self.proj_matrix[2, 2] = (self.opt.zfar + self.opt.znear) / (self.opt.zfar - self.opt.znear)
+        self.proj_matrix[3, 2] = - (self.opt.zfar * self.opt.znear) / (self.opt.zfar - self.opt.znear)
         self.proj_matrix[2, 3] = 1
+
+    def refresh_fov(self):
+        """Public method to refresh FOV-dependent values after opt.fovy changes."""
+        self._update_fov_cache()
 
     def render(self, gaussians, batch_id, cam_view, cam_view_proj, cam_pos, bg_color=None, scale_modifier=1):
         # gaussians: [N, 14]

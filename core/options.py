@@ -29,14 +29,18 @@ class Options:
     gaussian_loss: str = 'False'
     use_normal_head: str = 'False'
     use_rotation_head: str = 'False'
+    use_ggca: str = 'False'  # Enable Geometry-Gated Cross-Attention
+    use_text_adapter: str = 'False'  # Enable Text Adapter for LongCLIP feature adaptation
+    freeze_base: str = 'False'  # When True, freeze all base params, only train head params
     use_text: str = 'True'
     use_local_pretrained_ckpt: str = 'False'
     text_description: str = 'Cap3D_automated_Objaverse_full.csv'
     ema_rate: float = 0.999
     radius: float = 1/2
     use_checkpoint: str = 'True'
-    lambda_geo_normal: float = 1.0
-    lambda_tex_normal: float = 1.0
+    lambda_geo_normal: float = 0.1
+    lambda_tex_normal: float = 0.1
+    normal_loss_warmup_epochs: int = 5  # Linearly ramp normal losses from 0 to full weight over this many epochs
 
     ## fit gaussians
     gaussian_list: str = 'pbr_train_list_gaussian.txt'
@@ -46,12 +50,15 @@ class Options:
     ### dataset
     # data mode (only support s3 now)
     data_mode: Literal['s3'] = 's3'
-    # fovy of the dataset
-    fovy: float = 30
+    # fovy of the dataset (TexVerse v2: 39.6 degrees, fy=711.11, h=512)
+    fovy: float = 39.6
     # camera near plane
     znear: float = 0.5
     # camera far plane
     zfar: float = 2.5
+    # Apply OBJ Y-up → Blender Z-up rotation to pointcloud (x,y,z)→(x,-z,y).
+    # Required when GT was rendered in Blender but pointcloud is raw OBJ coords.
+    obj_to_blender_rotation: bool = True
     # number of all views (input + output)
     num_views: int = 8
     total_num_views: int = 64
@@ -90,8 +97,10 @@ class Options:
     ### training
     # workspace
     workspace: str = 'workspace'
-    # resume
+    # resume model weights
     resume: Optional[str] = None
+    # resume full training state (optimizer, scheduler, epoch) - path to training_state.pt
+    resume_training_state: Optional[str] = None
     # batch size (per-GPU)
     batch_size: int = 8
     # ckpt interval

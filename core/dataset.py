@@ -3,6 +3,11 @@ import csv
 import json
 import glob
 import cv2
+
+# Suppress libpng "eXIf: duplicate" warnings that flood the console
+import os as _os
+_os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "0")
+cv2.setLogLevel(0)  # ERROR only — suppresses libpng warnings routed through cv2
 import numpy as np
 
 import torch
@@ -117,7 +122,11 @@ class TexGaussianDataset(Dataset):
         if self.use_text and self.use_longclip:
             _, self.longclip_tokenize = resolve_longclip_module()
 
-        # default camera intrinsics
+        # camera intrinsics - try to read from first sample's transforms.json
+        fovy = self._detect_fovy_from_data()
+        if fovy is not None and abs(fovy - self.opt.fovy) > 0.5:
+            print(f"[INFO] Dataset FOV detected: {fovy:.2f} (overriding default {self.opt.fovy:.2f})")
+            self.opt.fovy = fovy
         self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.opt.fovy))
         self.proj_matrix = torch.zeros(4, 4, dtype=torch.float32)
         self.proj_matrix[0, 0] = 1 / self.tan_half_fov
@@ -125,6 +134,29 @@ class TexGaussianDataset(Dataset):
         self.proj_matrix[2, 2] = (self.opt.zfar + self.opt.znear) / (self.opt.zfar - self.opt.znear)
         self.proj_matrix[3, 2] = - (self.opt.zfar * self.opt.znear) / (self.opt.zfar - self.opt.znear)
         self.proj_matrix[2, 3] = 1
+
+    def _detect_fovy_from_data(self):
+        """Auto-detect vertical FOV from the first sample's transforms.json intrinsics.
+        Returns fovy in degrees, or None if detection fails.
+        """
+        image_root = self.train_image_root if self.training else self.test_image_root
+        for item in self.items[:5]:  # try first few items
+            tf_path = os.path.join(image_root, item["uid"], "transforms.json")
+            if not os.path.isfile(tf_path):
+                continue
+            try:
+                with open(tf_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                intrinsics = data.get("intrinsics", {})
+                fy = intrinsics.get("fy")
+                h = intrinsics.get("h")
+                if fy and h and fy > 0 and h > 0:
+                    fovy_rad = 2.0 * np.arctan(h / (2.0 * fy))
+                    fovy_deg = float(np.rad2deg(fovy_rad))
+                    return fovy_deg
+            except Exception:
+                continue
+        return None
 
     def _load_items(self, split_path):
         if not split_path.lower().endswith(".tsv"):
@@ -369,6 +401,23 @@ class TexGaussianDataset(Dataset):
 
         points = self._normalize_points(points)
         normals = self._normalize_normals(normals)
+
+        # OBJ files use Y-up; Blender renders in Z-up after importing.
+        # The camera matrices in transforms.json are in Blender's Z-up world.
+        # Apply R_x(90°): (x, y, z) → (x, -z, y) to align pointcloud with cameras.
+        if getattr(self.opt, 'obj_to_blender_rotation', True):
+            points_rot = np.empty_like(points)
+            points_rot[:, 0] = points[:, 0]
+            points_rot[:, 1] = -points[:, 2]
+            points_rot[:, 2] = points[:, 1]
+            points = points_rot
+
+            normals_rot = np.empty_like(normals)
+            normals_rot[:, 0] = normals[:, 0]
+            normals_rot[:, 1] = -normals[:, 2]
+            normals_rot[:, 2] = normals[:, 1]
+            normals = normals_rot
+
         return {
             "points": np.ascontiguousarray(points),
             "normals": np.ascontiguousarray(normals),
@@ -468,7 +517,7 @@ class TexGaussianDataset(Dataset):
                 image = image.permute(2, 0, 1)  # [3, H, W]
                 image = image[[2, 1, 0]].contiguous()  # bgr -> rgb
                 mask = mask.permute(2, 0, 1).contiguous()  # [1, H, W]
-                image = image * mask + (1 - mask)  # white bg
+                image = image * mask  # black bg, matching renderer bg_color=zeros
 
                 h, w = image.shape[1], image.shape[2]
 
@@ -483,8 +532,12 @@ class TexGaussianDataset(Dataset):
                     metal = self._resize_hwc(metal, h, w)
                     rough = rough[:, :, :1].permute(2, 0, 1).contiguous()  # [1, H, W]
                     metal = metal[:, :, :1].permute(2, 0, 1).contiguous()  # [1, H, W]
-                    rough = rough * mask + (1 - mask)
-                    metal = metal * mask + (1 - mask)
+                    # Use black background (zeros) to match material_bg=zeros in renderer.
+                    # The masked MSE loss already zeros out background pixels via gt_masks,
+                    # but bilinear-interpolated mask edges leak the bg value, so matching
+                    # pred bg (black) with gt bg (black) eliminates edge artifacts.
+                    rough = rough * mask
+                    metal = metal * mask
 
                 if self.use_normal_head:
                     normal_path = self._first_existing(self._candidate_paths(item, image_dir, vid, prefix, "normal"))

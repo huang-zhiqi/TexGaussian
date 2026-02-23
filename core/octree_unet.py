@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import numpy as np
-from typing import Tuple, Literal
+from typing import Tuple, Literal, Optional
 from torch.utils.checkpoint import checkpoint
 
 import ocnn
@@ -18,6 +18,181 @@ def ckpt_conv_wrapper(conv_op, x, *args):
 
     return checkpoint(
         conv_wrapper, x, dummy, *args, use_reentrant=False)
+
+
+class GeometryGatedCrossAttention(nn.Module):
+    """
+    Geometry-Gated Cross-Attention (GGCA) module with inner-dim projection and FFN.
+    
+    Uses mesh normals to modulate the cross-attention between text features and 
+    geometry features. The gate learns to selectively apply text conditioning 
+    based on local geometric properties (e.g., flat vs detailed regions).
+    
+    Key design choices:
+    - inner_dim projection: lifts low-dim features (e.g. 64) to a higher-dim space
+      (e.g. 256) for attention, giving each head a reasonable head_dim (e.g. 32).
+    - FFN block after attention: standard transformer practice for capacity.
+    - Geometry gate: sigmoid gate modulated by normals controls text influence.
+    
+    Args:
+        dim: Feature dimension (input/output)
+        num_heads: Number of attention heads
+        context_dim: Text embedding dimension (e.g., 768 for CLIP/LongCLIP)
+        inner_dim: Dimension for attention computation (default: 4*dim).
+                   Set None to use 4*dim automatically.
+        ffn_mult: FFN hidden dim multiplier relative to inner_dim (default: 4.0)
+        normal_dim: Dimension of normal vectors (default: 3)
+        gate_bias: Initial bias for the gate (default: 0.0, starting with 50/50)
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        context_dim: int,
+        inner_dim: Optional[int] = None,
+        ffn_mult: float = 4.0,
+        normal_dim: int = 3,
+        gate_bias: float = 0.0,
+        attn_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.normal_dim = normal_dim
+        self.inner_dim = inner_dim if inner_dim is not None else dim * 4
+        
+        # --- Input projection (dim -> inner_dim) ---
+        self.use_proj = (self.inner_dim != dim)
+        if self.use_proj:
+            self.proj_in = nn.Linear(dim, self.inner_dim)
+            self.proj_out = nn.Linear(self.inner_dim, dim)
+            # Zero-init proj_out so GGCA starts as identity
+            nn.init.zeros_(self.proj_out.weight)
+            nn.init.zeros_(self.proj_out.bias)
+        
+        # --- Cross-attention in inner_dim space ---
+        self.cross_norm = nn.LayerNorm(self.inner_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.inner_dim, 
+            num_heads=num_heads, 
+            dropout=attn_drop,
+            kdim=context_dim, 
+            vdim=context_dim, 
+            batch_first=True
+        )
+        
+        # --- FFN after attention (standard transformer block) ---
+        ffn_hidden = int(self.inner_dim * ffn_mult)
+        self.ffn_norm = nn.LayerNorm(self.inner_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.inner_dim, ffn_hidden),
+            nn.GELU(),
+            nn.Linear(ffn_hidden, self.inner_dim),
+        )
+        # Zero-init FFN output for residual safety
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+        
+        # --- Geometry gate network ---
+        # Input: concatenation of features (dim) and normals (normal_dim)
+        # Output: per-point gate value in [0, 1]
+        gate_hidden = max(dim // 2, 16)
+        self.gate_net = nn.Sequential(
+            nn.Linear(dim + normal_dim, gate_hidden),
+            nn.SiLU(),
+            nn.Linear(gate_hidden, gate_hidden // 2),
+            nn.SiLU(),
+            nn.Linear(gate_hidden // 2, 1),
+        )
+        
+        # Initialize gate properly
+        self._init_gate(gate_bias)
+        
+    def _init_gate(self, bias: float):
+        """
+        Initialize gate network: Kaiming for intermediate layers (break symmetry),
+        zero for output layer (start at sigmoid(bias) ≈ 0.5 when bias=0).
+        """
+        for module in self.gate_net:
+            if isinstance(module, nn.Linear):
+                # Kaiming init so gradients flow from the start
+                nn.init.kaiming_normal_(module.weight, nonlinearity='linear')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        # Zero-init the final layer so gate starts at sigmoid(bias)
+        final_linear = self.gate_net[-1]
+        nn.init.zeros_(final_linear.weight)
+        if final_linear.bias is not None:
+            nn.init.constant_(final_linear.bias, bias)
+    
+    def forward(
+        self, 
+        data: torch.Tensor, 
+        octree, 
+        depth: int, 
+        context: Optional[torch.Tensor] = None,
+        normals: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            data: Feature tensor [N, dim]
+            octree: Octree structure
+            depth: Current octree depth
+            context: Text embeddings [B, seq_len, context_dim]
+            normals: Per-point normal vectors [N, 3]
+            
+        Returns:
+            Gated output tensor [N, dim]
+        """
+        if context is None:
+            return data
+        
+        # Project to inner_dim if needed
+        if self.use_proj:
+            h = self.proj_in(data)  # [N, inner_dim]
+        else:
+            h = data
+            
+        # Cross-attention (pre-norm)
+        h_norm = self.cross_norm(h)
+        
+        batch_id = octree.batch_id(depth=depth, nempty=True)
+        batch_size = octree.batch_size
+        
+        cross_attn_results = []
+        for i in range(batch_size):
+            mask = (batch_id == i)
+            cross_attn_i = h_norm[mask]
+            cross_attn_i, _ = self.cross_attn(
+                query=cross_attn_i.unsqueeze(0),
+                key=context[i:i+1],
+                value=context[i:i+1]
+            )
+            cross_attn_results.append(cross_attn_i.squeeze(0))
+        
+        attn_out = torch.cat(cross_attn_results, dim=0)
+        h = h + attn_out  # Residual
+        
+        # FFN (pre-norm)
+        h = h + self.ffn(self.ffn_norm(h))  # Residual
+        
+        # Project back to dim
+        if self.use_proj:
+            h = self.proj_out(h)  # [N, dim]
+        
+        # Compute geometry gate
+        if normals is not None:
+            normals = F.normalize(normals, dim=-1, eps=1e-6)
+            gate_input = torch.cat([data, normals], dim=-1)
+            gate = torch.sigmoid(self.gate_net(gate_input))  # [N, 1]
+        else:
+            gate = 0.5
+        
+        # Gated residual connection
+        # gate ~ 1: trust text-conditioned attention
+        # gate ~ 0: trust original features (geometry-driven)
+        out = data + gate * h
+        
+        return out
 
 class CrossAttention(nn.Module):
     def __init__(
@@ -286,10 +461,12 @@ class OctreeUNet(nn.Module):
         layers_per_block: int = 2,
         skip_scale: float = np.sqrt(0.5),
         use_checkpoint: bool = True,
+        use_ggca: bool = False,  # Enable Geometry-Gated Cross-Attention
     ):
         super().__init__()
 
         self.use_checkpoint = use_checkpoint
+        self.use_ggca = use_ggca
 
         down_channels = [model_channels * m for m in channel_mult]
         up_channels = [model_channels * m for m in channel_mult[::-1]]
@@ -363,8 +540,28 @@ class OctreeUNet(nn.Module):
         self.conv_out = ocnn.nn.OctreeConv(up_channels[-1], out_channels, kernel_size=[3], nempty=True, use_bias=True)
         self.conv = ocnn.nn.OctreeConv(out_channels, out_channels, kernel_size=[3], nempty=True, use_bias=True)
 
-    def forward(self, x, octree, condition = None, return_features: bool = False):
-        # x: [B, Cin, H, W]
+        # GGCA: Geometry-Gated Cross-Attention (optional)
+        # Uses inner_dim projection so attention runs in a higher-dim space
+        # with reasonable head_dim (e.g. 32), then projects back to feature dim.
+        self.ggca = None
+        if use_ggca:
+            ggca_inner = up_channels[-1] * 4   # 64 * 4 = 256
+            ggca_heads = max(ggca_inner // 32, 1)  # head_dim=32 -> 8 heads
+            self.ggca = GeometryGatedCrossAttention(
+                dim=up_channels[-1],
+                num_heads=ggca_heads,
+                context_dim=context_dim,
+                inner_dim=ggca_inner,
+                ffn_mult=4.0,
+                normal_dim=3,
+                gate_bias=0.0,  # sigmoid(0)=0.5, balanced start for faster learning
+            )
+
+    def forward(self, x, octree, condition = None, return_features: bool = False, normals: Optional[torch.Tensor] = None, condition_ggca: Optional[torch.Tensor] = None):
+        # x: [N, Cin] where N is number of non-empty octree nodes
+        # normals: [N, 3] mesh normals for GGCA (optional)
+        # condition_ggca: adapted text embeddings for GGCA only (optional;
+        #                 when None, falls back to condition for backward compat)
 
         input_data = x
 
@@ -400,11 +597,25 @@ class OctreeUNet(nn.Module):
         # last
         x = self.norm_out(x, octree, depth)
         x = F.silu(x)
-        feat = x
+        
+        # GGCA: enrich features with text+geometry conditioning for new heads only.
+        # Frozen base conv_out/conv use unmodified x to preserve multi-view
+        # consistency — GGCA perturbations on frozen heads cause OOD feature
+        # injection that degrades roughness, cross-view consistency, and FID.
+        ggca_cond = condition_ggca if condition_ggca is not None else condition
+        if self.ggca is not None and ggca_cond is not None and return_features:
+            if self.use_checkpoint:
+                feat = checkpoint(self.ggca, x, octree, depth, ggca_cond, normals, use_reentrant=False)
+            else:
+                feat = self.ggca(x, octree, depth, ggca_cond, normals)
+        else:
+            feat = x
+        
+        # Frozen base heads use unmodified features (x, not feat)
         if self.use_checkpoint:
             x = ckpt_conv_wrapper(self.conv_out, x, octree, depth)
         else:
-            x = self.conv_out(x, octree, depth) # [B, Cout, H', W']
+            x = self.conv_out(x, octree, depth) # [N, Cout]
         
         if self.use_checkpoint:
             x = ckpt_conv_wrapper(self.conv, x, octree, depth)

@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="texverse_longclip_heads"
+EXP_NAME="texverse_stage1_new_modules_v3"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -41,16 +41,18 @@ USE_LONGCLIP="True"
 
 # 最大处理样本数 (-1 表示处理所有样本)
 # 用于快速测试或部分推理
-MAX_SAMPLES=2
+MAX_SAMPLES=20
 
 # 预训练权重路径
 # CKPT_PATH="./assets/ckpts/PBR_model.safetensors"
 #训练得到的权重路径
-CKPT_PATH="../experiments/texverse_longclip_heads/2026.02.11-19:38:52_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
+CKPT_PATH="../experiments/texverse_stage1_new_modules_v3/2026.02.22-16:36:16_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
 
 # 新增分支开关（仅使用新开关）
 USE_NORMAL_HEAD="True"
 USE_ROTATION_HEAD="True"
+USE_GGCA="True"  # Geometry-Gated Cross-Attention
+USE_TEXT_ADAPTER="True"  # Text Adapter for LongCLIP
 
 # 多GPU配置
 # GPU_IDS: 使用的GPU编号，逗号分隔 (例如: "0,1,2,3")
@@ -58,8 +60,8 @@ USE_ROTATION_HEAD="True"
 # WORKERS_PER_GPU: 每张GPU上并行运行的进程数
 #   - "auto": 根据GPU显存自动计算最优值 (推荐)
 #   - 数字 (如 "2"): 手动指定固定数量
-GPU_IDS="0"
-NUM_GPUS=1
+GPU_IDS="0,1"
+NUM_GPUS=2
 WORKERS_PER_GPU="auto"
 
 # ==========================================
@@ -73,6 +75,8 @@ echo "Max Samples: ${MAX_SAMPLES}"
 echo "Checkpoint: ${CKPT_PATH}"
 echo "Use Normal Head: ${USE_NORMAL_HEAD}"
 echo "Use Rotation Head: ${USE_ROTATION_HEAD}"
+echo "Use GGCA: ${USE_GGCA}"
+echo "Use Text Adapter: ${USE_TEXT_ADAPTER}"
 echo "GPU IDs: ${GPU_IDS}, Num GPUs: ${NUM_GPUS}, Workers/GPU: ${WORKERS_PER_GPU}"
 echo "Total parallel workers: $((NUM_GPUS * WORKERS_PER_GPU))"
 echo "Textures will be stored under: ${OUTPUT_ROOT}/textures"
@@ -86,6 +90,8 @@ python3 texture.py objaverse \
 --use_longclip "${USE_LONGCLIP}" \
 --use_normal_head "${USE_NORMAL_HEAD}" \
 --use_rotation_head "${USE_ROTATION_HEAD}" \
+--use_ggca "${USE_GGCA}" \
+--use_text_adapter "${USE_TEXT_ADAPTER}" \
 --max-samples "${MAX_SAMPLES}" \
 --gpu-ids "${GPU_IDS}" \
 --num-gpus "${NUM_GPUS}" \

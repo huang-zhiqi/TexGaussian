@@ -13,6 +13,12 @@ try:
 except Exception:
     dr = None
 
+try:
+    import bpy as _bpy
+    _HAS_BPY = True
+except ImportError:
+    _HAS_BPY = False
+
 
 def _to_tensor(x, device, dtype=torch.float32):
     if torch.is_tensor(x):
@@ -127,6 +133,73 @@ def compute_vertex_tangents(
     return tan, bitan, nrm
 
 
+def _compute_mikktspace_tbn(v_np, f_np, vt_np, ft_np, vn_np):
+    """Compute per-face-loop MikkTSpace TBN using Blender's bpy API.
+
+    This produces tangent/bitangent/normal per face-corner (loop) that exactly
+    matches Blender's internal ShaderNodeNormalMap TANGENT space, eliminating
+    the round-trip error caused by inconsistent TBN bases.
+
+    NOTE: ``vn_np`` is accepted for API compatibility but is NOT used.
+    Blender's auto-computed smooth-shading normals are used instead, matching
+    the normals that Blender will use when rendering the NormalMap shader
+    (the render script calls ``shade_smooth()`` after OBJ import).
+
+    Returns
+    -------
+    vt_loop : ndarray (F*3, 2)   – UV coordinates per loop
+    ft_loop : ndarray (F, 3)     – face indices into the per-loop arrays
+    tan     : ndarray (F*3, 3)   – MikkTSpace tangent per loop
+    bitan   : ndarray (F*3, 3)   – bitangent per loop (cross(N,T)*sign)
+    nrm     : ndarray (F*3, 3)   – normal per loop
+    """
+    num_faces = f_np.shape[0]
+    num_loops = num_faces * 3
+
+    # --- Create temporary Blender mesh ---
+    mesh = _bpy.data.meshes.new("_mikktspace_tmp")
+    mesh.from_pydata(v_np.tolist(), [], f_np.tolist())
+    mesh.update()
+
+    # --- Set smooth shading on all faces (matches render script's shade_smooth) ---
+    mesh.polygons.foreach_set("use_smooth", [True] * num_faces)
+
+    # --- Set UV coordinates per loop (bulk) ---
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    loop_uv_indices = ft_np.reshape(-1)        # (F*3,)
+    per_loop_uv = vt_np[loop_uv_indices]       # (F*3, 2)
+    uv_layer.data.foreach_set("uv", per_loop_uv.ravel().tolist())
+
+    # NOTE: We intentionally do NOT set custom normals here.
+    # Blender's auto-computed smooth normals are used, matching what the
+    # render script (shade_smooth + ShaderNodeNormalMap) will produce.
+
+    # --- Compute MikkTSpace tangents ---
+    mesh.calc_tangents(uvmap="UVMap")
+
+    # --- Bulk-read per-loop tangent data ---
+    tangent_flat = np.zeros(num_loops * 3, dtype=np.float32)
+    btsign_flat  = np.zeros(num_loops,     dtype=np.float32)
+    normal_flat  = np.zeros(num_loops * 3, dtype=np.float32)
+
+    mesh.loops.foreach_get("tangent",        tangent_flat)
+    mesh.loops.foreach_get("bitangent_sign", btsign_flat)
+    mesh.loops.foreach_get("normal",         normal_flat)
+
+    # --- Reshape and compute bitangent ---
+    tan = tangent_flat.reshape(num_loops, 3)
+    nrm = normal_flat.reshape(num_loops, 3)
+    bitan = np.cross(nrm, tan) * btsign_flat[:, None]
+
+    # --- Per-loop face index layout (each face-corner is a unique vertex) ---
+    ft_loop = np.arange(num_loops, dtype=np.int64).reshape(num_faces, 3)
+
+    # --- Clean up ---
+    _bpy.data.meshes.remove(mesh)
+
+    return per_loop_uv, ft_loop, tan, bitan, nrm
+
+
 def save_normal_map(mesh, pred_world_normal_map, save_path, flip_green=False):
     if dr is None:
         raise RuntimeError("nvdiffrast is required for save_normal_map.")
@@ -154,30 +227,45 @@ def save_normal_map(mesh, pred_world_normal_map, save_path, flip_green=False):
 
     h, w = normal.shape[:2]
 
-    v = _to_tensor(v, device)
-    f = _to_tensor(f, device, dtype=torch.int64)
-    vt = _to_tensor(vt, device)
-    ft = _to_tensor(ft, device, dtype=torch.int64)
-    vn = _to_tensor(vn, device)
+    # ---- Choose TBN computation method ----
+    if _HAS_BPY:
+        # MikkTSpace path: per-face-loop TBN, exact match with Blender
+        vt_loop_np, ft_loop_np, tan_np, bitan_np, nrm_np = _compute_mikktspace_tbn(
+            v, f, vt, ft, vn
+        )
+        vt_rast = torch.tensor(vt_loop_np, device=device, dtype=torch.float32)
+        ft_rast = torch.tensor(ft_loop_np, device=device, dtype=torch.int32).contiguous()
+        tan   = torch.tensor(tan_np,   device=device, dtype=torch.float32)
+        bitan = torch.tensor(bitan_np, device=device, dtype=torch.float32)
+        nrm   = torch.tensor(nrm_np,   device=device, dtype=torch.float32)
+    else:
+        # Fallback: UV-gradient tangents (may not match Blender MikkTSpace)
+        v_t  = _to_tensor(v,  device)
+        f_t  = _to_tensor(f,  device, dtype=torch.int64)
+        vt_t = _to_tensor(vt, device)
+        ft_t = _to_tensor(ft, device, dtype=torch.int64)
+        vn_t = _to_tensor(vn, device)
+        tan, bitan, nrm = compute_vertex_tangents(v_t, f_t, vt_t, ft_t, vn_t)
+        vt_rast = vt_t
+        ft_rast = ft_t.to(dtype=torch.int32).contiguous()
 
-    tan, bitan, nrm = compute_vertex_tangents(v, f, vt, ft, vn)
-
+    # ---- Rasterize TBN into UV space ----
     glctx = dr.RasterizeCudaContext() if torch.cuda.is_available() else dr.RasterizeGLContext()
-    uv = vt * 2.0 - 1.0
+    uv = vt_rast * 2.0 - 1.0
     uv = torch.cat([uv, torch.zeros_like(uv[:, :1]), torch.ones_like(uv[:, :1])], dim=-1)
-    ft_i32 = ft.to(dtype=torch.int32).contiguous()
-    rast, _ = dr.rasterize(glctx, uv.unsqueeze(0), ft_i32, (h, w))
+    rast, _ = dr.rasterize(glctx, uv.unsqueeze(0), ft_rast, (h, w))
 
-    t_map, _ = dr.interpolate(tan.unsqueeze(0), rast, ft_i32)
-    b_map, _ = dr.interpolate(bitan.unsqueeze(0), rast, ft_i32)
-    n_map, _ = dr.interpolate(nrm.unsqueeze(0), rast, ft_i32)
-    mask, _ = dr.interpolate(torch.ones_like(vt[:, :1]).unsqueeze(0), rast, ft_i32)
+    t_map, _ = dr.interpolate(tan.unsqueeze(0),   rast, ft_rast)
+    b_map, _ = dr.interpolate(bitan.unsqueeze(0), rast, ft_rast)
+    n_map, _ = dr.interpolate(nrm.unsqueeze(0),   rast, ft_rast)
+    mask,  _ = dr.interpolate(torch.ones_like(vt_rast[:, :1]).unsqueeze(0), rast, ft_rast)
 
     t_map = F.normalize(t_map.squeeze(0), dim=-1, eps=1e-6)
     b_map = F.normalize(b_map.squeeze(0), dim=-1, eps=1e-6)
     n_map = F.normalize(n_map.squeeze(0), dim=-1, eps=1e-6)
     mask = mask.squeeze(0)
 
+    # ---- Project world-space normal onto TBN ----
     n_tan = torch.stack(
         [
             (normal * t_map).sum(dim=-1),

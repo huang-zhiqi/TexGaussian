@@ -285,7 +285,9 @@ def import_and_normalize(mesh_path: str) -> bpy.types.Object:
         mesh_obj.scale = (scale, scale, scale)
         mesh_obj.select_set(True)
         bpy.context.view_layer.objects.active = mesh_obj
-        bpy.ops.object.transform_apply(scale=True)
+        # Bake ALL transforms (rotation from OBJ Y-up→Blender Z-up + scale)
+        # so that world-space vertices match raw OBJ coords after normalization.
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
     bpy.ops.object.shade_smooth()
     return mesh_obj

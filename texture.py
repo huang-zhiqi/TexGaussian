@@ -166,6 +166,7 @@ class Converter(nn.Module):
             self._init_longclip()
 
         self.text_embedding = None
+        self.text_embedding_ggca = None
         if self.opt.use_text and self.opt.text_prompt:
             self.set_text_prompt(self.opt.text_prompt)
 
@@ -221,10 +222,13 @@ class Converter(nn.Module):
         
         If use_longclip is enabled, uses LongCLIP for encoding (supports longer context).
         Otherwise, uses the standard CLIP encoder from the model.
+        
+        Stores raw embeddings (for frozen CAs) and adapted embeddings (for GGCA).
         """
         self.opt.text_prompt = text_prompt
         if not self.opt.use_text:
             self.text_embedding = None
+            self.text_embedding_ggca = None
             return
 
         if self.opt.use_longclip and self.longclip_model is not None:
@@ -241,13 +245,27 @@ class Converter(nn.Module):
                 x = self.longclip_model.transformer(x)
                 x = x.permute(1, 0, 2)  # LND -> NLD
                 x = self.longclip_model.ln_final(x)
-                self.text_embedding = x.float()  # [bs, context_length, dim]
+                self.text_embedding = x.float()  # [bs, context_length, dim] — raw
             print(f"[INFO] Text encoded with LongCLIP (context_length={context_length})")
         else:
             # Use standard CLIP encoder
             token = tokenize(text_prompt)
             token = token.to(self.device)
-            self.text_embedding = self.model.text_encoder.encode(token).float()  # [bs, 77, 768]
+            self.text_embedding = self.model.text_encoder.encode(token).float()  # [bs, 77, 768] — raw
+
+        # Adapted embedding for GGCA only; raw embedding for frozen CAs
+        # Use EMA text adapter at inference for consistency with EMA model
+        adapter = None
+        if hasattr(self.model, 'ema_text_adapter') and self.model.ema_text_adapter is not None:
+            adapter = self.model.ema_text_adapter
+        elif hasattr(self.model, 'text_adapter') and self.model.text_adapter is not None:
+            adapter = self.model.text_adapter
+        if adapter is not None:
+            with torch.no_grad():
+                self.text_embedding_ggca = adapter(self.text_embedding)
+            print(f"[INFO] TextAdapter (EMA) applied to text embedding (GGCA only)")
+        else:
+            self.text_embedding_ggca = self.text_embedding
 
     def load_mesh(self, path, num_samples = 200000):
         self.mesh = trimesh.load(path, force = 'mesh')
@@ -316,7 +334,10 @@ class Converter(nn.Module):
         batch_id = self.octree_in.batch_id(self.opt.input_depth, nempty = True)
         
         if use_normal and hasattr(self, "normal_gaussians"):
-            out = self.gs_renderer.render(self.normal_gaussians, batch_id, cam_view.unsqueeze(0), cam_view_proj.unsqueeze(0), cam_pos.unsqueeze(0))
+            # Use blue flat-normal background [0.5, 0.5, 1.0] to match render_mesh
+            # and training's compute_normal_losses behaviour.
+            normal_bg = torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32, device=self.device)
+            out = self.gs_renderer.render(self.normal_gaussians, batch_id, cam_view.unsqueeze(0), cam_view_proj.unsqueeze(0), cam_pos.unsqueeze(0), bg_color=normal_bg)
         elif use_material:
             out = self.gs_renderer.render(self.mr_gaussians, batch_id, cam_view.unsqueeze(0), cam_view_proj.unsqueeze(0), cam_pos.unsqueeze(0))
         else:
@@ -369,11 +390,13 @@ class Converter(nn.Module):
 
         if self.opt.use_material:
             _, self.gaussians, self.mr_gaussians, pred_normal_world = self.model.forward_gaussians(
-                self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True
+                self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True,
+                condition_ggca = getattr(self, 'text_embedding_ggca', None)
             )
         else:
             _, self.gaussians, _, pred_normal_world = self.model.forward_gaussians(
-                self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True
+                self.input_data, self.octree_in, condition = self.text_embedding, data = None, ema = True,
+                condition_ggca = getattr(self, 'text_embedding_ggca', None)
             )
             self.mr_gaussians = None
 
@@ -1157,6 +1180,8 @@ if __name__ == "__main__":
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
     opt.use_normal_head = str2bool(opt.use_normal_head)
     opt.use_rotation_head = str2bool(opt.use_rotation_head)
+    opt.use_ggca = str2bool(opt.use_ggca)
+    opt.use_text_adapter = str2bool(opt.use_text_adapter)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
     opt.use_longclip = str2bool(opt.use_longclip)
 
