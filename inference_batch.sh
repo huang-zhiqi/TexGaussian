@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="texverse_stage1_new_modules_v3"
+EXP_NAME="texverse_stage1_new_modules_v6"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -46,11 +46,9 @@ MAX_SAMPLES=20
 # 预训练权重路径
 # CKPT_PATH="./assets/ckpts/PBR_model.safetensors"
 #训练得到的权重路径
-CKPT_PATH="../experiments/texverse_stage1_new_modules_v3/2026.02.22-16:36:16_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
+CKPT_PATH="../experiments/texverse_stage1_new_modules_v6/2026.02.25-02:22:08_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
 
-# 新增分支开关（仅使用新开关）
-USE_NORMAL_HEAD="True"
-USE_ROTATION_HEAD="True"
+# 新增分支开关
 USE_GGCA="True"  # Geometry-Gated Cross-Attention
 USE_TEXT_ADAPTER="True"  # Text Adapter for LongCLIP
 
@@ -60,8 +58,13 @@ USE_TEXT_ADAPTER="True"  # Text Adapter for LongCLIP
 # WORKERS_PER_GPU: 每张GPU上并行运行的进程数
 #   - "auto": 根据GPU显存自动计算最优值 (推荐)
 #   - 数字 (如 "2"): 手动指定固定数量
-GPU_IDS="0,1"
-NUM_GPUS=2
+# GPU_IDS="0,1"
+# NUM_GPUS=2
+# WORKERS_PER_GPU="auto"
+
+# 4卡配置 (解开注释使用)
+GPU_IDS="0,1,2,3"
+NUM_GPUS=4
 WORKERS_PER_GPU="auto"
 
 # ==========================================
@@ -73,8 +76,6 @@ echo "Caption: ${CAPTION_FIELD}"
 echo "LongCLIP: ${USE_LONGCLIP}"
 echo "Max Samples: ${MAX_SAMPLES}"
 echo "Checkpoint: ${CKPT_PATH}"
-echo "Use Normal Head: ${USE_NORMAL_HEAD}"
-echo "Use Rotation Head: ${USE_ROTATION_HEAD}"
 echo "Use GGCA: ${USE_GGCA}"
 echo "Use Text Adapter: ${USE_TEXT_ADAPTER}"
 echo "GPU IDs: ${GPU_IDS}, Num GPUs: ${NUM_GPUS}, Workers/GPU: ${WORKERS_PER_GPU}"
@@ -88,8 +89,6 @@ python3 texture.py objaverse \
 --output_dir "${OUTPUT_ROOT}" \
 --save_image False \
 --use_longclip "${USE_LONGCLIP}" \
---use_normal_head "${USE_NORMAL_HEAD}" \
---use_rotation_head "${USE_ROTATION_HEAD}" \
 --use_ggca "${USE_GGCA}" \
 --use_text_adapter "${USE_TEXT_ADAPTER}" \
 --max-samples "${MAX_SAMPLES}" \

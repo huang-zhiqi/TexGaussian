@@ -27,20 +27,15 @@ class Options:
     output_size: int = 512
     use_material: str = 'True'
     gaussian_loss: str = 'False'
-    use_normal_head: str = 'False'
-    use_rotation_head: str = 'False'
-    use_ggca: str = 'False'  # Enable Geometry-Gated Cross-Attention
+    use_ggca: str = 'False'  # Enable Geometry-Gated Cross-Attention (at conv_out entrance)
     use_text_adapter: str = 'False'  # Enable Text Adapter for LongCLIP feature adaptation
-    freeze_base: str = 'False'  # When True, freeze all base params, only train head params
+    freeze_base: str = 'False'  # When True, freeze all base params, only train GGCA/adapter params
     use_text: str = 'True'
     use_local_pretrained_ckpt: str = 'False'
     text_description: str = 'Cap3D_automated_Objaverse_full.csv'
     ema_rate: float = 0.999
     radius: float = 1/2
     use_checkpoint: str = 'True'
-    lambda_geo_normal: float = 0.1
-    lambda_tex_normal: float = 0.1
-    normal_loss_warmup_epochs: int = 5  # Linearly ramp normal losses from 0 to full weight over this many epochs
 
     ## fit gaussians
     gaussian_list: str = 'pbr_train_list_gaussian.txt'

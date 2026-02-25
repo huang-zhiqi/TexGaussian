@@ -31,7 +31,7 @@ EXP_NAME="texverse_stage2_finetune"
 WORKSPACE="${EXPERIMENTS_ROOT}/${EXP_NAME}"
 
 # 从阶段1的checkpoint继续
-STAGE1_WORKSPACE="${EXPERIMENTS_ROOT}/texverse_stage1_new_modules"
+STAGE1_WORKSPACE="${EXPERIMENTS_ROOT}/texverse_stage1_new_modules_v6"
 
 # 自动查找最新的 checkpoint（按修改时间排序）
 find_latest_ckpt() {
@@ -101,8 +101,6 @@ fi
 # 特征开关 - 保持所有模块启用，解冻 base
 USE_TEXT_ADAPTER="True"
 USE_GGCA="True"
-USE_NORMAL_HEAD="True"
-USE_ROTATION_HEAD="True"
 FREEZE_BASE="False"         # ⚠️ 关键：解冻基础模型！
 
 # 优化配置 - 使用较低学习率避免破坏预训练权重
@@ -110,9 +108,6 @@ BATCH_SIZE=1
 GRAD_ACC=4                 # 有效batch = 1 * NUM_GPUS * 4
 NUM_EPOCHS=20              # 适度训练，增加 epoch 让 base 充分适配
 LR=5e-5                    # ⚠️ 较低学习率
-LAMBDA_GEO_NORMAL=0.1      # 与 Stage1 保持一致
-LAMBDA_TEX_NORMAL=0.1      # 与 Stage1 保持一致
-NORMAL_WARMUP=3            # Stage2 起始已有基础，warmup 更短
 
 # =========================
 # 验证并打印配置
@@ -147,7 +142,6 @@ echo ""
 echo "  Resume Mode: ${RESUME_MODE} (stage2=恢复训练, stage1=新训练)"
 echo "  TextAdapter: ${USE_TEXT_ADAPTER}"
 echo "  GGCA: ${USE_GGCA}"
-echo "  Normal/Rotation Heads: ${USE_NORMAL_HEAD}/${USE_ROTATION_HEAD}"
 echo "  Freeze Base: ${FREEZE_BASE}"
 echo "  Learning Rate: ${LR} (低学习率)"
 echo "  Epochs: ${NUM_EPOCHS}"
@@ -185,14 +179,9 @@ ARGS=(
   --use_longclip "${USE_LONGCLIP}"
   --longclip_model "${LONGCLIP_MODEL}"
   --longclip_context_length "${LONGCLIP_CONTEXT_LENGTH}"
-  --use_normal_head "${USE_NORMAL_HEAD}"
-  --use_rotation_head "${USE_ROTATION_HEAD}"
   --use_ggca "${USE_GGCA}"
   --use_text_adapter "${USE_TEXT_ADAPTER}"
   --freeze_base "${FREEZE_BASE}"
-  --lambda_geo_normal "${LAMBDA_GEO_NORMAL}"
-  --lambda_tex_normal "${LAMBDA_TEX_NORMAL}"
-  --normal_loss_warmup_epochs "${NORMAL_WARMUP}"
   --resume "${RESUME_CKPT}"
 )
 

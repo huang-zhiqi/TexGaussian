@@ -557,10 +557,10 @@ class OctreeUNet(nn.Module):
                 gate_bias=0.0,  # sigmoid(0)=0.5, balanced start for faster learning
             )
 
-    def forward(self, x, octree, condition = None, return_features: bool = False, normals: Optional[torch.Tensor] = None, condition_ggca: Optional[torch.Tensor] = None):
+    def forward(self, x, octree, condition = None, normals: Optional[torch.Tensor] = None, condition_ggca: Optional[torch.Tensor] = None):
         # x: [N, Cin] where N is number of non-empty octree nodes
-        # normals: [N, 3] mesh normals for GGCA (optional)
-        # condition_ggca: adapted text embeddings for GGCA only (optional;
+        # normals: [N, 3] mesh normals for GGCA geometry gate (optional)
+        # condition_ggca: adapted text embeddings for GGCA (optional;
         #                 when None, falls back to condition for backward compat)
 
         input_data = x
@@ -598,20 +598,16 @@ class OctreeUNet(nn.Module):
         x = self.norm_out(x, octree, depth)
         x = F.silu(x)
         
-        # GGCA: enrich features with text+geometry conditioning for new heads only.
-        # Frozen base conv_out/conv use unmodified x to preserve multi-view
-        # consistency — GGCA perturbations on frozen heads cause OOD feature
-        # injection that degrades roughness, cross-view consistency, and FID.
+        # GGCA: enrich ALL features with text+geometry conditioning at conv_out entrance.
+        # This allows text-conditioned information to flow into all output heads
+        # (albedo, roughness, metallic, opacity, scale) through the shared conv_out.
         ggca_cond = condition_ggca if condition_ggca is not None else condition
-        if self.ggca is not None and ggca_cond is not None and return_features:
+        if self.ggca is not None and ggca_cond is not None:
             if self.use_checkpoint:
-                feat = checkpoint(self.ggca, x, octree, depth, ggca_cond, normals, use_reentrant=False)
+                x = checkpoint(self.ggca, x, octree, depth, ggca_cond, normals, use_reentrant=False)
             else:
-                feat = self.ggca(x, octree, depth, ggca_cond, normals)
-        else:
-            feat = x
+                x = self.ggca(x, octree, depth, ggca_cond, normals)
         
-        # Frozen base heads use unmodified features (x, not feat)
         if self.use_checkpoint:
             x = ckpt_conv_wrapper(self.conv_out, x, octree, depth)
         else:
@@ -625,6 +621,4 @@ class OctreeUNet(nn.Module):
         assert depth == octree.depth
         assert x.shape[0] == input_data.shape[0]
 
-        if return_features:
-            return x, feat
         return x

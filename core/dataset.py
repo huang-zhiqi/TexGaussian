@@ -80,7 +80,6 @@ class TexGaussianDataset(Dataset):
         self.use_longclip = _to_bool(self.opt.use_longclip)
         self.use_text = _to_bool(self.opt.use_text)
         self.use_material = _to_bool(self.opt.use_material)
-        self.use_normal_head = _to_bool(self.opt.use_normal_head)
         self.caption_field = getattr(self.opt, "caption_field", "caption_short")
         self.longclip_tokenize = None
         self.pointcloud_dir = (getattr(self.opt, "pointcloud_dir", "") or "").strip()
@@ -349,9 +348,6 @@ class TexGaussianDataset(Dataset):
                 return False, "missing_rough"
             if not self._has_multiview_channel_from_image_dir(image_dir, "metal"):
                 return False, "missing_metal"
-        if self.use_normal_head:
-            if not self._has_multiview_channel_from_image_dir(image_dir, "normal"):
-                return False, "missing_normal"
         return True, ""
 
     def _validate_items_or_raise(self, items):
@@ -473,7 +469,6 @@ class TexGaussianDataset(Dataset):
         # load num_views images
         images = []
         masks = []
-        normal_maps = []
         if self.use_material:
             material_images = []
         cam_poses = []
@@ -539,26 +534,12 @@ class TexGaussianDataset(Dataset):
                     rough = rough * mask
                     metal = metal * mask
 
-                if self.use_normal_head:
-                    normal_path = self._first_existing(self._candidate_paths(item, image_dir, vid, prefix, "normal"))
-                    if normal_path is None:
-                        continue
-                    normal_map = self._read_image(normal_path)
-                    normal_map = self._resize_hwc(normal_map, h, w)
-                    if normal_map.shape[2] >= 3:
-                        normal_map = normal_map[:, :, :3]
-                    else:
-                        normal_map = normal_map.repeat(1, 1, 3)
-                    normal_map = normal_map.permute(2, 0, 1)  # [3, H, W]
-                    normal_map = normal_map[[2, 1, 0]].contiguous()  # bgr -> rgb
             except Exception:
                 continue
 
             images.append(image)
             if self.use_material:
                 material_images.append(torch.cat([rough, metal], dim=0))
-            if self.use_normal_head:
-                normal_maps.append(normal_map)
             masks.append(mask.squeeze(0))
             cam_poses.append(c2w)
 
@@ -578,8 +559,6 @@ class TexGaussianDataset(Dataset):
                 cam_poses.append(cam_poses[-1].clone())
                 if self.use_material:
                     material_images.append(material_images[-1].clone())
-                if self.use_normal_head:
-                    normal_maps.append(normal_maps[-1].clone())
 
         images = torch.stack(images, dim=0) # [V, C, H, W]
 
@@ -597,10 +576,6 @@ class TexGaussianDataset(Dataset):
             material_images = F.interpolate(material_images, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False)
             results['rough_images_output'] = material_images[:, :1, ...]
             results['metallic_images_output'] = material_images[:, 1:2, ...]
-
-        if self.use_normal_head:
-            normal_maps = torch.stack(normal_maps, dim=0)
-            results['gt_normal_map'] = F.interpolate(normal_maps, size=(self.opt.output_size, self.opt.output_size), mode='bilinear', align_corners=False)
 
         # opengl to colmap camera for gaussian renderer
         cam_poses[:, :3, 1:3] *= -1 # invert up & forward direction

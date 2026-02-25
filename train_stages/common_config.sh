@@ -28,12 +28,12 @@ export CUDA_LAUNCH_BLOCKING=0
 # GPU 配置 (根据你的显卡数量调整)
 # =========================
 # 2卡配置
-GPU_IDS="0,1"
-NUM_GPUS=2
+# GPU_IDS="0,1"
+# NUM_GPUS=2
 
 # 4卡配置 (解开注释使用)
-# GPU_IDS="0,1,2,3"
-# NUM_GPUS=4
+GPU_IDS="0,1,2,3"
+NUM_GPUS=4
 
 ACC_CONFIG="acc_configs/gpu${NUM_GPUS}.yaml"
 MAIN_PORT=8878
@@ -183,8 +183,6 @@ PY
     --pointcloud_dir "${POINTCLOUD_DIR}" \
     --tsv_path "${temp_tsv}" \
     --caption_field "${CAPTION_FIELD}" \
-    --use_normal_head "True" \
-    --use_rotation_head "True" \
     --use_ggca "True" \
     --use_text_adapter "True" \
     --num_gpus 1 \

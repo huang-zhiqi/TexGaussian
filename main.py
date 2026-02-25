@@ -107,8 +107,6 @@ def main():
     opt.use_checkpoint = str2bool(opt.use_checkpoint)
     opt.use_material = str2bool(opt.use_material)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
-    opt.use_normal_head = str2bool(opt.use_normal_head)
-    opt.use_rotation_head = str2bool(opt.use_rotation_head)
     opt.use_ggca = str2bool(opt.use_ggca)
     opt.use_text_adapter = str2bool(opt.use_text_adapter)
     opt.freeze_base = str2bool(opt.freeze_base)
@@ -236,7 +234,7 @@ def main():
         if skipped_nontensor:
             accelerator.print(f"[INFO] skipped non-tensor checkpoint entries: {skipped_nontensor}")
         accelerator.print(f"[INFO] loaded checkpoint tensors: {len(filtered_ckpt)}")
-        accelerator.print("Loaded base PBR weights. 'normal_head' (and 'rotation_head') weights were initialized freshly.")
+        accelerator.print("Loaded base PBR weights.")
         
         # CRITICAL: Sync ema_model with model after loading checkpoint
         # This ensures ema_model starts from the same pretrained weights as model
@@ -281,17 +279,12 @@ def main():
 
     # optimizer
     use_head_lr_split = (
-        (opt.use_normal_head or opt.use_rotation_head or opt.use_ggca or opt.use_text_adapter)
-        and (hasattr(model, "normal_head") or hasattr(model, "rotation_head") or 
-             (hasattr(model, "model") and hasattr(model.model, "ggca") and model.model.ggca is not None) or
+        (opt.use_ggca or opt.use_text_adapter)
+        and ((hasattr(model, "model") and hasattr(model.model, "ggca") and model.model.ggca is not None) or
              (hasattr(model, "text_adapter") and model.text_adapter is not None))
     )
     if use_head_lr_split:
         head_params = []
-        if hasattr(model, "normal_head"):
-            head_params += list(model.normal_head.parameters())
-        if hasattr(model, "rotation_head"):
-            head_params += list(model.rotation_head.parameters())
         # Include GGCA parameters
         if hasattr(model, "model") and hasattr(model.model, "ggca") and model.model.ggca is not None:
             head_params += list(model.model.ggca.parameters())
@@ -305,7 +298,7 @@ def main():
         if opt.freeze_base:
             for p in base_params:
                 p.requires_grad = False
-            accelerator.print(f"[INFO] Freezing {len(base_params)} base parameters, only training {len(head_params)} head/GGCA/adapter parameters")
+            accelerator.print(f"[INFO] Freezing {len(base_params)} base parameters, only training {len(head_params)} GGCA/adapter parameters")
             optimizer = torch.optim.AdamW(
                 head_params,
                 lr=opt.lr,
@@ -381,9 +374,6 @@ def main():
     for epoch in range(start_epoch, opt.num_epochs):
         # train
         model.train()
-        # Set current epoch for normal loss warmup scheduling
-        unwrapped = accelerator.unwrap_model(model)
-        unwrapped.current_epoch = epoch
         total_loss = 0
         total_psnr = 0
         if opt.use_material:
@@ -401,8 +391,6 @@ def main():
                 albedo_loss = out['albedo_loss']
                 mask_loss = out['mask_loss']
                 lpips_loss = out['lpips_loss']
-                normal_geo_loss = out.get('normal_geo_loss', 0.0)
-                normal_tex_loss = out.get('normal_tex_loss', 0.0)
 
                 if opt.use_material:
                     rough_loss = out['roughness_loss']
@@ -443,17 +431,13 @@ def main():
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} loss: {loss.item():.6f} \
 gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} roughness_loss: {rough_loss:.6f} \
-metallic_loss: {metallic_loss:.6f} mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} \
-normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} time: {t:.3f}")
+metallic_loss: {metallic_loss:.6f} mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
 
                     else:
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} \
 loss: {loss.item():.6f} gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} \
-mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} \
-normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} time: {t:.3f}")
-
-                    # writer.add_scalar('loss', loss, epoch * len(train_dataloader) + i)
+mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
 
                     writer.add_scalar('loss', out['loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('gaussian_loss', out['gaussian_loss'], epoch * len(train_dataloader) + i)
@@ -461,9 +445,6 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                     writer.add_scalar('mask_loss', out['mask_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('lpips_loss', out['lpips_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('psnr', out['psnr'], epoch * len(train_dataloader) + i)
-                    if opt.use_normal_head or opt.use_rotation_head:
-                        writer.add_scalar('normal_geo_loss', out['normal_geo_loss'], epoch * len(train_dataloader) + i)
-                        writer.add_scalar('normal_tex_loss', out['normal_tex_loss'], epoch * len(train_dataloader) + i)
 
                     if opt.use_material:
                         writer.add_scalar('roughness_loss', out['roughness_loss'], epoch * len(train_dataloader) + i)
@@ -503,22 +484,6 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                             kiui.write_image(f'{opt.pred_image_dir}/{epoch}_metal_{uid[0]}.jpg', metal_pred)
                         else:
                             kiui.write_image(f'{opt.pred_image_dir}/{epoch}_metal_{i}.jpg', metal_pred)
-
-                    # Save normal predictions if available
-                    if 'normal_images_pred' in out:
-                        normal_pred_vis = out['normal_images_pred'].detach().cpu().numpy()  # [B, V, 3, H, W]
-                        normal_pred_vis = normal_pred_vis.transpose(0, 3, 1, 4, 2).reshape(-1, normal_pred_vis.shape[1] * normal_pred_vis.shape[3], 3)
-                        if opt.batch_size == 1:
-                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_normal_{uid[0]}.jpg', normal_pred_vis)
-                        else:
-                            kiui.write_image(f'{opt.pred_image_dir}/{epoch}_normal_{i}.jpg', normal_pred_vis)
-
-                        normal_gt_vis = out['normal_images_gt'].detach().cpu().numpy()  # [B, V, 3, H, W]
-                        normal_gt_vis = normal_gt_vis.transpose(0, 3, 1, 4, 2).reshape(-1, normal_gt_vis.shape[1] * normal_gt_vis.shape[3], 3)
-                        if opt.batch_size == 1:
-                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_normal_{uid[0]}.jpg', normal_gt_vis)
-                        else:
-                            kiui.write_image(f'{opt.gt_image_dir}/{epoch}_normal_{i}.jpg', normal_gt_vis)
 
                     # Save pred alpha (mask) and GT mask for visual comparison
                     pred_mask_vis = out['alphas_pred'].detach().cpu().numpy()  # [B, V, 1, H, W]
@@ -663,16 +628,6 @@ normal_geo_loss: {normal_geo_loss:.6f} normal_tex_loss: {normal_tex_loss:.6f} ti
                         metal_pred = np.repeat(metal_pred, 3, axis=2)
                         metal_pred = metal_pred.transpose(0, 3, 1, 4, 2).reshape(-1, metal_pred.shape[1] * metal_pred.shape[3], 3)
                         kiui.write_image(f'{opt.workspace}/eval_pred_images/{epoch}_metal_{uid[0]}.jpg', metal_pred)
-
-                    # Save normal predictions if available
-                    if 'normal_images_pred' in out:
-                        normal_pred_vis = out['normal_images_pred'].detach().cpu().numpy()
-                        normal_pred_vis = normal_pred_vis.transpose(0, 3, 1, 4, 2).reshape(-1, normal_pred_vis.shape[1] * normal_pred_vis.shape[3], 3)
-                        kiui.write_image(f'{opt.workspace}/eval_pred_images/{epoch}_normal_{uid[0]}.jpg', normal_pred_vis)
-
-                        normal_gt_vis = out['normal_images_gt'].detach().cpu().numpy()
-                        normal_gt_vis = normal_gt_vis.transpose(0, 3, 1, 4, 2).reshape(-1, normal_gt_vis.shape[1] * normal_gt_vis.shape[3], 3)
-                        kiui.write_image(f'{opt.workspace}/eval_gt_images/{epoch}_normal_{uid[0]}.jpg', normal_gt_vis)
 
                 torch.cuda.empty_cache()
 

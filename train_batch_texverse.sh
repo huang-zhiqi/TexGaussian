@@ -54,8 +54,6 @@ USE_MATERIAL="True"
 USE_LONGCLIP="True"
 LONGCLIP_MODEL="third_party/Long-CLIP/checkpoints/longclip-L.pt"
 LONGCLIP_CONTEXT_LENGTH=248
-USE_NORMAL_HEAD="True"
-USE_ROTATION_HEAD="True"
 FREEZE_BASE="True"  # 冻结基础模型，只训练新增模块
 USE_GGCA="True"  # 启用 Geometry-Gated Cross-Attention
 USE_TEXT_ADAPTER="False"  # 暂时禁用，确保 albedo 不受影响（LongCLIP 特征已对齐）
@@ -69,8 +67,6 @@ GRAD_ACC=8
 NUM_EPOCHS=1  # 冻结训练通常1个epoch足够
 LR=4e-4
 MIXED_PRECISION="bf16"
-LAMBDA_GEO_NORMAL=1.0
-LAMBDA_TEX_NORMAL=1.0
 
 echo "[INFO] Training config"
 echo "  GPUs: ${GPU_IDS} (num_processes=${NUM_GPUS})"
@@ -78,7 +74,6 @@ echo "  Accelerate config: ${ACC_CONFIG}"
 echo "  Workspace: ${WORKSPACE}"
 echo "  Resume: ${RESUME_CKPT}"
 echo "  LongCLIP: ${USE_LONGCLIP} (${LONGCLIP_MODEL})"
-echo "  Heads: normal=${USE_NORMAL_HEAD}, rotation=${USE_ROTATION_HEAD}"
 echo "  GGCA: ${USE_GGCA}"
 echo "  Text Adapter: ${USE_TEXT_ADAPTER}"
 echo "  Freeze base: ${FREEZE_BASE}"
@@ -142,16 +137,15 @@ if [[ "${GPU_COUNT}" -ne "${NUM_GPUS}" ]]; then
 fi
 
 echo "[INFO] Running dataset preflight checks..."
-python - "${TRAIN_LIST}" "${TRAIN_IMAGE_DIR}" "${TEST_LIST}" "${TEST_IMAGE_DIR}" "${POINTCLOUD_DIR}" "${CAPTION_FIELD}" "${USE_MATERIAL}" "${USE_NORMAL_HEAD}" <<'PY'
+python - "${TRAIN_LIST}" "${TRAIN_IMAGE_DIR}" "${TEST_LIST}" "${TEST_IMAGE_DIR}" "${POINTCLOUD_DIR}" "${CAPTION_FIELD}" "${USE_MATERIAL}" <<'PY'
 import csv
 import glob
 import os
 import sys
 import numpy as np
 
-train_tsv, train_image_dir, test_tsv, test_image_dir, pointcloud_dir, caption_field, use_material, use_normal_head = sys.argv[1:]
+train_tsv, train_image_dir, test_tsv, test_image_dir, pointcloud_dir, caption_field, use_material = sys.argv[1:]
 use_material = use_material.lower() == "true"
-use_normal_head = use_normal_head.lower() == "true"
 
 with open(train_tsv, "r", encoding="utf-8", newline="") as f:
     reader = csv.DictReader(f, delimiter="\t")
@@ -226,9 +220,6 @@ def check_split(split_name, tsv_path, image_dir):
             bad.append("rough")
         if not has_multiview_channel_from_image_dir(cam_dir, "metal"):
             bad.append("metal")
-    if use_normal_head:
-        if not has_multiview_channel_from_image_dir(cam_dir, "normal"):
-            bad.append("normal")
     if bad:
         raise SystemExit(
             f"[ERROR] {split_name} first sample does not expose channels: "
@@ -263,13 +254,9 @@ ARGS=(
   --use_longclip "${USE_LONGCLIP}"
   --longclip_model "${LONGCLIP_MODEL}"
   --longclip_context_length "${LONGCLIP_CONTEXT_LENGTH}"
-  --use_normal_head "${USE_NORMAL_HEAD}"
-  --use_rotation_head "${USE_ROTATION_HEAD}"
   --use_ggca "${USE_GGCA}"
   --use_text_adapter "${USE_TEXT_ADAPTER}"
   --freeze_base "${FREEZE_BASE}"
-  --lambda_geo_normal "${LAMBDA_GEO_NORMAL}"
-  --lambda_tex_normal "${LAMBDA_TEX_NORMAL}"
 )
 
 if [[ -n "${RESUME_CKPT}" ]]; then
