@@ -42,7 +42,8 @@ class GeometryGatedCrossAttention(nn.Module):
                    Set None to use 4*dim automatically.
         ffn_mult: FFN hidden dim multiplier relative to inner_dim (default: 4.0)
         normal_dim: Dimension of normal vectors (default: 3)
-        gate_bias: Initial bias for the gate (default: 0.0, starting with 50/50)
+        gate_bias: Initial bias for the gate (default: -2.0, sigmoid(-2)≈0.12)
+        output_scale: Initial scale for the gated output (default: 0.1)
     """
     def __init__(
         self,
@@ -52,7 +53,8 @@ class GeometryGatedCrossAttention(nn.Module):
         inner_dim: Optional[int] = None,
         ffn_mult: float = 4.0,
         normal_dim: int = 3,
-        gate_bias: float = 0.0,
+        gate_bias: float = -2.0,
+        output_scale: float = 0.1,
         attn_drop: float = 0.0,
     ):
         super().__init__()
@@ -65,8 +67,9 @@ class GeometryGatedCrossAttention(nn.Module):
         if self.use_proj:
             self.proj_in = nn.Linear(dim, self.inner_dim)
             self.proj_out = nn.Linear(self.inner_dim, dim)
-            # Zero-init proj_out so GGCA starts as identity
-            nn.init.zeros_(self.proj_out.weight)
+            # Xavier init for proj_out: allows gradient flow from step 1.
+            # Safety is ensured by output_scale * gate (starts at ~0.1 * 0.12 ≈ 0.012)
+            nn.init.xavier_uniform_(self.proj_out.weight, gain=0.1)
             nn.init.zeros_(self.proj_out.bias)
         
         # --- Cross-attention in inner_dim space ---
@@ -88,9 +91,14 @@ class GeometryGatedCrossAttention(nn.Module):
             nn.GELU(),
             nn.Linear(ffn_hidden, self.inner_dim),
         )
-        # Zero-init FFN output for residual safety
-        nn.init.zeros_(self.ffn[-1].weight)
+        # Xavier init for FFN output: allows gradient flow through FFN.
+        # Safety ensured by output_scale * gate at the module output.
+        nn.init.xavier_uniform_(self.ffn[-1].weight, gain=0.1)
         nn.init.zeros_(self.ffn[-1].bias)
+        
+        # Learnable output scale (replaces zero-init as the safety mechanism)
+        # Starts small so GGCA contribution is initially ~output_scale * sigmoid(gate_bias)
+        self.output_scale = nn.Parameter(torch.tensor(output_scale))
         
         # --- Geometry gate network ---
         # Input: concatenation of features (dim) and normals (normal_dim)
@@ -110,7 +118,11 @@ class GeometryGatedCrossAttention(nn.Module):
     def _init_gate(self, bias: float):
         """
         Initialize gate network: Kaiming for intermediate layers (break symmetry),
-        zero for output layer (start at sigmoid(bias) ≈ 0.5 when bias=0).
+        small-scale Xavier for output layer with negative bias so gate starts small.
+        
+        With bias=-2: sigmoid(-2) ≈ 0.12, giving a small initial text contribution.
+        Using Xavier (not zero) for the output layer weight allows gradients to flow
+        back through all gate_net layers from step 1.
         """
         for module in self.gate_net:
             if isinstance(module, nn.Linear):
@@ -118,9 +130,9 @@ class GeometryGatedCrossAttention(nn.Module):
                 nn.init.kaiming_normal_(module.weight, nonlinearity='linear')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        # Zero-init the final layer so gate starts at sigmoid(bias)
+        # Small-scale Xavier for the final layer (not zero!) so gradient flows
         final_linear = self.gate_net[-1]
-        nn.init.zeros_(final_linear.weight)
+        nn.init.xavier_uniform_(final_linear.weight, gain=0.01)
         if final_linear.bias is not None:
             nn.init.constant_(final_linear.bias, bias)
     
@@ -187,10 +199,13 @@ class GeometryGatedCrossAttention(nn.Module):
         else:
             gate = 0.5
         
-        # Gated residual connection
+        # Gated residual connection with learnable scale
+        # output_scale * gate controls GGCA contribution:
+        #   - Starts at ~0.1 * sigmoid(-2) ≈ 0.012 (safe, near-identity)
+        #   - Can grow as training progresses
         # gate ~ 1: trust text-conditioned attention
         # gate ~ 0: trust original features (geometry-driven)
-        out = data + gate * h
+        out = data + self.output_scale * gate * h
         
         return out
 
@@ -554,7 +569,8 @@ class OctreeUNet(nn.Module):
                 inner_dim=ggca_inner,
                 ffn_mult=4.0,
                 normal_dim=3,
-                gate_bias=0.0,  # sigmoid(0)=0.5, balanced start for faster learning
+                gate_bias=-2.0,    # sigmoid(-2)≈0.12, starts with small text contribution
+                output_scale=0.1,  # learnable scale, replaces zero-init for safe startup
             )
 
     def forward(self, x, octree, condition = None, normals: Optional[torch.Tensor] = None, condition_ggca: Optional[torch.Tensor] = None):
