@@ -42,6 +42,21 @@ import traceback
 import warnings
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+# Parse --gpu early (before torch import) so CUDA_VISIBLE_DEVICES takes effect
+def _parse_gpu_early() -> Optional[str]:
+    """Extract --gpu from sys.argv before any CUDA library is loaded."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--gpu" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("--gpu="):
+            return arg.split("=", 1)[1]
+    return None
+
+_gpu_id = _parse_gpu_early()
+if _gpu_id is not None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    print(f"[INFO] Setting CUDA_VISIBLE_DEVICES={_gpu_id}")
+
 # Set environment variables BEFORE importing torch to prevent CUDA issues
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
@@ -197,6 +212,15 @@ def parse_args() -> argparse.Namespace:
         "--reprojection",
         action="store_true",
         help="Also compute depth-based reprojection metrics (requires depth maps and dense views).",
+    )
+    parser.add_argument(
+        "--gpu",
+        default=None,
+        help=(
+            "GPU ID to use (e.g., '0', '1', '2,3'). Sets CUDA_VISIBLE_DEVICES before "
+            "CUDA init so torch.device('cuda') maps to the selected GPU. "
+            "If not specified, uses the existing CUDA_VISIBLE_DEVICES environment variable."
+        ),
     )
     return parser.parse_args()
 

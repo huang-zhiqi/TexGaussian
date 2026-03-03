@@ -45,8 +45,8 @@ conda activate "$ENV_NAME"
 set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
-# 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
-EXPERIMENT_NAME="${1:-texverse_stage1_new_modules_v6}"
+# 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高), GPU_ID环境变量选择GPU
+EXPERIMENT_NAME="${1:-texverse_stage1_new_modules_v8}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered_test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
 # If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will combine all images
@@ -57,6 +57,7 @@ UNLIT_SUBDIR="${UNLIT_SUBDIR:-"unlit"}"
 # 降低默认批量大小以避免 OOM (从 8 改为 4)
 BATCH_SIZE="${BATCH_SIZE:-8}"
 DEVICE="${DEVICE:-cuda}"
+GPU_ID="${GPU_ID:-6}"
 # KID subset size: 100 is recommended for stable estimation
 KID_SUBSET_SIZE="${KID_SUBSET_SIZE:-100}"
 CLIP_MODEL="${CLIP_MODEL:-"ViT-B/32"}"
@@ -99,6 +100,7 @@ echo "Metrics:            $METRICS"
 echo "Consistency pairs:  $CONSISTENCY_PAIRS"
 echo "Consistency chan:   $CONSISTENCY_CHANNEL"
 echo "Output:             $OUTPUT"
+echo "GPU ID:             $GPU_ID"
 echo "Conda env:          $ENV_NAME"
 echo "=============================================="
 
@@ -117,7 +119,8 @@ export TOKENIZERS_PARALLELISM="false"
 # export CUDA_LAUNCH_BLOCKING=1
 
 # 运行评估脚本，同时输出到终端和日志文件
-CUDA_VISIBLE_DEVICES=0 python -u scripts/eval_metrics.py \
+python -u scripts/eval_metrics.py \
+  --gpu "$GPU_ID" \
   --experiment_name "$EXPERIMENT_NAME" \
   --base_gt_dir "$BASE_GT_DIR" \
   --base_gen_dir "$BASE_GEN_DIR" \
