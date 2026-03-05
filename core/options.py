@@ -30,6 +30,9 @@ class Options:
     use_ggca: str = 'False'  # Enable Geometry-Gated Cross-Attention (at conv_out entrance)
     use_text_adapter: str = 'False'  # Enable Text Adapter for LongCLIP feature adaptation
     freeze_base: str = 'False'  # When True, freeze all base params, only train GGCA/adapter params
+    unfreeze_attn_kv: str = 'False'  # Unfreeze CrossAttention K,V projections (adapts to LongCLIP distribution)
+    unfreeze_norms: str = 'False'  # Unfreeze all GroupNorm/LayerNorm affine params
+    adapt_lr_scale: float = 0.1  # Learning rate multiplier for unfrozen base params (K,V,norms)
     use_text: str = 'True'
     use_local_pretrained_ckpt: str = 'False'
     text_description: str = 'Cap3D_automated_Objaverse_full.csv'

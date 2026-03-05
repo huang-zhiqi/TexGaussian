@@ -88,19 +88,27 @@ class TextAdapter(nn.Module):
     def _init_weights(self):
         """Initialize weights so adapter starts as near-identity mapping.
         
-        Intermediate layers use Xavier init (break symmetry, allow gradient flow),
-        only the final layer is zero-initialized so output starts at zero.
+        All layers use Xavier init for proper gradient flow.
+        The final layer uses a small gain (0.1) so the adapter output
+        starts near zero, keeping the residual connection near-identity.
+        Combined with residual_scale (0.1), initial perturbation is ~1%.
+        
+        Previous zero-init on the final layer was a gradient deadlock bug:
+        W_2=0 makes ∂L/∂W_1 = scale * ∂L/∂out * W_2^T * ... = 0,
+        blocking the intermediate layer from learning until W_2 grows.
         """
         linear_layers = [m for m in self.adapter if isinstance(m, nn.Linear)]
         for i, module in enumerate(linear_layers):
             if i < len(linear_layers) - 1:
-                # Intermediate: Xavier init
+                # Intermediate: Xavier init (standard gain)
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             else:
-                # Final layer: zero init (adapter output starts at 0)
-                nn.init.zeros_(module.weight)
+                # Final layer: Xavier with small gain (NOT zero-init!)
+                # Allows gradient to flow back through all layers from step 1.
+                # Safety: residual_scale (0.1) * small_output ≈ 1% perturbation.
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -299,7 +307,7 @@ class TexGaussian(nn.Module):
             return gaussian_loss, gaussians, None
 
 
-    def set_input(self, input=None):
+    def set_input(self, input=None, ema=False):
         def points2octree(points):
             octree = ocnn.octree.Octree(depth = self.input_depth, full_depth = self.full_depth)
             octree.build_octree(points)
@@ -328,15 +336,26 @@ class TexGaussian(nn.Module):
 
         if self.opt.use_text:
             text_embeds = self.text_encoder.encode(input['token']).float()
-            # Apply text adapter to ALL embeddings (single embedding stream)
-            # When using LongCLIP, the adapter bridges the distribution gap for
-            # both frozen CrossAttention layers AND GGCA, rather than only GGCA.
+            # Unified text stream: TextAdapter adapts embeddings for ALL consumers
+            # (both frozen CrossAttention and GGCA) simultaneously.
+            #
+            # Why NOT split streams (raw→CA, adapted→GGCA):
+            #   The pretrained CA was trained with 77-token CLIP, but LongCLIP raw
+            #   embeddings are 248-token with different distribution — neither raw
+            #   nor adapted matches the original CLIP distribution. Splitting streams
+            #   causes CA and GGCA to pull in conflicting directions (v8 regression).
+            #   A unified adapted stream lets TextAdapter learn a SINGLE adaptation
+            #   that benefits both paths jointly (v7 validated this works better).
             if hasattr(self, 'text_adapter') and self.text_adapter is not None:
-                adapted = self.text_adapter(text_embeds)
+                # Use EMA text adapter during eval for consistency with ema_model
+                if ema and hasattr(self, 'ema_text_adapter') and self.ema_text_adapter is not None:
+                    adapted = self.ema_text_adapter(text_embeds)
+                else:
+                    adapted = self.text_adapter(text_embeds)
             else:
                 adapted = text_embeds
             input['text_embedding'] = adapted       # [bs, seq_len, 768]
-            input['text_embedding_ggca'] = adapted   # same adapted embeddings for GGCA
+            input['text_embedding_ggca'] = adapted   # same adapted for GGCA
 
     def forward(self, data, ema = False):
         # data: output of the dataloader
@@ -345,7 +364,7 @@ class TexGaussian(nn.Module):
         results = {}
         loss = 0
 
-        self.set_input(data)
+        self.set_input(data, ema=ema)
 
         octree = data['octree']
 

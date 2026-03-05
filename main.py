@@ -110,6 +110,8 @@ def main():
     opt.use_ggca = str2bool(opt.use_ggca)
     opt.use_text_adapter = str2bool(opt.use_text_adapter)
     opt.freeze_base = str2bool(opt.freeze_base)
+    opt.unfreeze_attn_kv = str2bool(opt.unfreeze_attn_kv)
+    opt.unfreeze_norms = str2bool(opt.unfreeze_norms)
     opt.use_text = str2bool(opt.use_text)
     opt.use_longclip = str2bool(opt.use_longclip)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
@@ -278,42 +280,109 @@ def main():
         )
 
     # optimizer
+    # =========================================================================
+    # Three-tier parameter grouping:
+    #   Tier 1 (head_params, full LR): GGCA + TextAdapter + conv_out + conv
+    #   Tier 2 (adapt_params, adapt_lr_scale × LR): CA K,V projections + norms
+    #   Tier 3 (frozen): everything else
+    #
+    # Tier 2 is controlled by --unfreeze_attn_kv and --unfreeze_norms.
+    # The K,V projections are the text→feature interface: they directly transform
+    # text embeddings into attention keys/values. When switching from CLIP to
+    # LongCLIP, these must adapt to the new token distribution (248 vs 77 tokens).
+    # Norm layers (GroupNorm/LayerNorm) are cheap to unfreeze and help the entire
+    # network adapt its feature statistics.
+    # =========================================================================
     use_head_lr_split = (
         (opt.use_ggca or opt.use_text_adapter)
         and ((hasattr(model, "model") and hasattr(model.model, "ggca") and model.model.ggca is not None) or
              (hasattr(model, "text_adapter") and model.text_adapter is not None))
     )
     if use_head_lr_split:
+        # --- Tier 1: new modules (full LR) ---
         head_params = []
-        # Include GGCA parameters
         if hasattr(model, "model") and hasattr(model.model, "ggca") and model.model.ggca is not None:
             head_params += list(model.model.ggca.parameters())
-        # Include Text Adapter parameters
         if hasattr(model, "text_adapter") and model.text_adapter is not None:
             head_params += list(model.text_adapter.parameters())
+        if hasattr(model, "model"):
+            for layer_name in ['conv_out', 'conv']:
+                layer = getattr(model.model, layer_name, None)
+                if layer is not None:
+                    head_params += list(layer.parameters())
+                    accelerator.print(f"[INFO] Including {layer_name} in head_params (trainable with GGCA)")
         head_param_ids = {id(p) for p in head_params}
-        base_params = [p for p in model.parameters() if p.requires_grad and id(p) not in head_param_ids]
+
+        # --- Tier 2: adapted base params (lower LR) ---
+        adapt_params = []
+        adapt_param_ids = set()
+
+        if opt.unfreeze_attn_kv and hasattr(model, "model"):
+            # Unfreeze K and V projection weights of all CrossAttention layers
+            # These are the text→feature interface: K/V proj transform text embeddings
+            # into attention key/value. Adapting them lets each CA layer learn the
+            # optimal text feature mapping for its depth level.
+            kv_count = 0
+            for name, param in model.model.named_parameters():
+                if id(param) in head_param_ids:
+                    continue  # skip GGCA's own K,V
+                if ('cross_attn.k_proj' in name or 'cross_attn.v_proj' in name):
+                    adapt_params.append(param)
+                    adapt_param_ids.add(id(param))
+                    kv_count += 1
+            accelerator.print(f"[INFO] Unfreezing {kv_count} CA K,V projection tensors ({sum(p.numel() for p in adapt_params):,} params)")
+
+        if opt.unfreeze_norms and hasattr(model, "model"):
+            # Unfreeze all GroupNorm and LayerNorm affine parameters
+            # This is a known effective strategy (BitFit, NormTuning) that lets
+            # the network adapt feature distribution statistics with minimal params.
+            norm_count = 0
+            for name, param in model.model.named_parameters():
+                if id(param) in head_param_ids or id(param) in adapt_param_ids:
+                    continue
+                # Match GroupNorm (weights/bias) and LayerNorm (weight/bias)
+                is_norm = ('norm' in name.lower() and
+                           any(k in name for k in ['weight', 'bias']))
+                if is_norm and param.numel() < 10000:  # safety: norms are small
+                    adapt_params.append(param)
+                    adapt_param_ids.add(id(param))
+                    norm_count += 1
+            norm_numel = sum(p.numel() for p in adapt_params[-norm_count:]) if norm_count > 0 else 0
+            accelerator.print(f"[INFO] Unfreezing {norm_count} norm layer tensors ({norm_numel:,} params)")
+
+        # --- Tier 3: everything else ---
+        all_tracked = head_param_ids | adapt_param_ids
+        base_params = [p for p in model.parameters()
+                       if p.requires_grad and id(p) not in all_tracked]
         
-        # Freeze base params if freeze_base is enabled
         if opt.freeze_base:
             for p in base_params:
                 p.requires_grad = False
-            accelerator.print(f"[INFO] Freezing {len(base_params)} base parameters, only training {len(head_params)} GGCA/adapter parameters")
-            optimizer = torch.optim.AdamW(
-                head_params,
-                lr=opt.lr,
-                weight_decay=0.05,
-                betas=(0.9, 0.95),
-            )
-        else:
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": base_params, "lr": opt.lr * 0.1},
-                    {"params": head_params, "lr": opt.lr},
-                ],
-                weight_decay=0.05,
-                betas=(0.9, 0.95),
-            )
+
+        # Build parameter summary
+        head_total = sum(p.numel() for p in head_params)
+        adapt_total = sum(p.numel() for p in adapt_params)
+        frozen_total = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        accelerator.print(f"[INFO] Parameter tiers:")
+        accelerator.print(f"  Tier 1 (head, LR={opt.lr}): {len(head_params)} tensors, {head_total:,} params ({head_total/1e6:.2f}M)")
+        accelerator.print(f"  Tier 2 (adapt, LR={opt.lr * opt.adapt_lr_scale}): {len(adapt_params)} tensors, {adapt_total:,} params ({adapt_total/1e6:.2f}M)")
+        accelerator.print(f"  Tier 3 (frozen): {frozen_total:,} params ({frozen_total/1e6:.1f}M)")
+        accelerator.print(f"  Total trainable: {head_total + adapt_total:,} ({(head_total + adapt_total)/1e6:.2f}M)")
+
+        # Build optimizer param groups
+        param_groups = [{"params": head_params, "lr": opt.lr}]
+        if adapt_params:
+            param_groups.append({"params": adapt_params, "lr": opt.lr * opt.adapt_lr_scale})
+        if not opt.freeze_base and base_params:
+            trainable_base = [p for p in base_params if p.requires_grad]
+            if trainable_base:
+                param_groups.append({"params": trainable_base, "lr": opt.lr * 0.01})
+
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+        )
     else:
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad == True],
@@ -329,14 +398,11 @@ def main():
     total_steps = opt.num_epochs * max(1, steps_per_epoch)
     accelerator.print(f"[INFO] LR schedule: {steps_per_epoch} optimizer steps/epoch, {total_steps} total steps")
     pct_start = min(0.3, max(0.01, 3000.0 / max(1, total_steps)))
-    if use_head_lr_split and not opt.freeze_base:
-        # Only use different LRs when not freezing base params
-        max_lr = [opt.lr * 0.1, opt.lr]
-    else:
-        max_lr = opt.lr
+    # Build max_lr list matching optimizer param groups
+    max_lr_list = [pg["lr"] for pg in optimizer.param_groups]
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=max_lr,
+        max_lr=max_lr_list,
         total_steps=max(1, total_steps),
         pct_start=pct_start,
     )
