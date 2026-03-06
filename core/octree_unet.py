@@ -56,10 +56,12 @@ class GeometryGatedCrossAttention(nn.Module):
         gate_bias: float = -2.0,
         output_scale: float = 0.1,
         attn_drop: float = 0.0,
+        use_geometry_gate: bool = True,  # When False, use learnable scalar gate (no normals needed)
     ):
         super().__init__()
         self.dim = dim
         self.normal_dim = normal_dim
+        self.use_geometry_gate = use_geometry_gate
         self.inner_dim = inner_dim if inner_dim is not None else dim * 4
         
         # --- Input projection (dim -> inner_dim) ---
@@ -100,20 +102,25 @@ class GeometryGatedCrossAttention(nn.Module):
         # Starts small so GGCA contribution is initially ~output_scale * sigmoid(gate_bias)
         self.output_scale = nn.Parameter(torch.tensor(output_scale))
         
-        # --- Geometry gate network ---
-        # Input: concatenation of features (dim) and normals (normal_dim)
-        # Output: per-point gate value in [0, 1]
-        gate_hidden = max(dim // 2, 16)
-        self.gate_net = nn.Sequential(
-            nn.Linear(dim + normal_dim, gate_hidden),
-            nn.SiLU(),
-            nn.Linear(gate_hidden, gate_hidden // 2),
-            nn.SiLU(),
-            nn.Linear(gate_hidden // 2, 1),
-        )
-        
-        # Initialize gate properly
-        self._init_gate(gate_bias)
+        # --- Gate mechanism ---
+        if use_geometry_gate:
+            # Geometry gate: modulated by normals + features
+            # Input: concatenation of features (dim) and normals (normal_dim)
+            # Output: per-point gate value in [0, 1]
+            gate_hidden = max(dim // 2, 16)
+            self.gate_net = nn.Sequential(
+                nn.Linear(dim + normal_dim, gate_hidden),
+                nn.SiLU(),
+                nn.Linear(gate_hidden, gate_hidden // 2),
+                nn.SiLU(),
+                nn.Linear(gate_hidden // 2, 1),
+            )
+            self._init_gate(gate_bias)
+        else:
+            # Learnable scalar gate (no normals needed, e.g. for coarse octree levels)
+            # Initialized to gate_bias so sigmoid(gate_bias) ≈ 0.12
+            self.gate_net = None
+            self.gate_scalar = nn.Parameter(torch.tensor(gate_bias))
         
     def _init_gate(self, bias: float):
         """
@@ -191,13 +198,20 @@ class GeometryGatedCrossAttention(nn.Module):
         if self.use_proj:
             h = self.proj_out(h)  # [N, dim]
         
-        # Compute geometry gate
-        if normals is not None:
-            normals = F.normalize(normals, dim=-1, eps=1e-6)
-            gate_input = torch.cat([data, normals], dim=-1)
-            gate = torch.sigmoid(self.gate_net(gate_input))  # [N, 1]
+        # Compute gate
+        if self.use_geometry_gate:
+            if normals is not None:
+                normals = F.normalize(normals, dim=-1, eps=1e-6)
+                gate_input = torch.cat([data, normals], dim=-1)
+                gate = torch.sigmoid(self.gate_net(gate_input))  # [N, 1]
+            else:
+                # Fallback: apply gate_net with zero normals so params get gradients
+                zero_normals = torch.zeros(data.shape[0], self.normal_dim, device=data.device, dtype=data.dtype)
+                gate_input = torch.cat([data, zero_normals], dim=-1)
+                gate = torch.sigmoid(self.gate_net(gate_input))  # [N, 1]
         else:
-            gate = 0.5
+            # Learnable scalar gate (broadcast to all points)
+            gate = torch.sigmoid(self.gate_scalar)  # scalar
         
         # Gated residual connection with learnable scale
         # output_scale * gate controls GGCA contribution:
@@ -559,6 +573,7 @@ class OctreeUNet(nn.Module):
         # Uses inner_dim projection so attention runs in a higher-dim space
         # with reasonable head_dim (e.g. 32), then projects back to feature dim.
         self.ggca = None
+        self.ggca_mid = None
         if use_ggca:
             ggca_inner = up_channels[-1] * 4   # 64 * 4 = 256
             ggca_heads = max(ggca_inner // 32, 1)  # head_dim=32 -> 8 heads
@@ -572,6 +587,25 @@ class OctreeUNet(nn.Module):
                 gate_bias=-2.0,    # sigmoid(-2)≈0.12, starts with small text contribution
                 output_scale=0.1,  # learnable scale, replaces zero-init for safe startup
             )
+
+            # GGCA@512: high-dimensional text fusion at decoder's last 512-dim layer
+            # Placed after up_blocks.1 (dim=512), where CrossAttention text features
+            # are richest. At this depth normals are unavailable (coarser octree level),
+            # so gate defaults to 0.5 (purely attention-based gating).
+            mid_dim = up_channels[1]  # 512 for standard architecture
+            if mid_dim >= 256:
+                ggca_mid_heads = max(mid_dim // 32, 1)  # 512/32 = 16 heads
+                self.ggca_mid = GeometryGatedCrossAttention(
+                    dim=mid_dim,
+                    num_heads=ggca_mid_heads,
+                    context_dim=context_dim,
+                    inner_dim=mid_dim,      # already high-dim, no need to project up
+                    ffn_mult=4.0,
+                    normal_dim=3,
+                    gate_bias=-2.0,
+                    output_scale=0.1,
+                    use_geometry_gate=False,  # no normals at coarse octree level
+                )
 
     def forward(self, x, octree, condition = None, normals: Optional[torch.Tensor] = None, condition_ggca: Optional[torch.Tensor] = None):
         # x: [N, Cin] where N is number of non-empty octree nodes
@@ -602,7 +636,8 @@ class OctreeUNet(nn.Module):
         x = self.mid_block(x, octree, depth, condition)
 
         # up
-        for block, upsample in zip(self.up_blocks, self.upsample):
+        ggca_cond = condition_ggca if condition_ggca is not None else condition
+        for i, (block, upsample) in enumerate(zip(self.up_blocks, self.upsample)):
             xs = xss[-len(block.nets):]
             xss = xss[:-len(block.nets)]
             x = block(x, xs, octree, depth, condition)
@@ -610,14 +645,22 @@ class OctreeUNet(nn.Module):
             if upsample:
                 depth += 1
 
+            # GGCA@512: apply high-dim text fusion after up_blocks.1
+            # At this point x is [N, 512] at the upsampled depth.
+            # normals=None because we're at a coarser octree level (gate→0.5).
+            if i == 1 and self.ggca_mid is not None and ggca_cond is not None:
+                if self.use_checkpoint:
+                    x = checkpoint(self.ggca_mid, x, octree, depth, ggca_cond, None, use_reentrant=False)
+                else:
+                    x = self.ggca_mid(x, octree, depth, ggca_cond, None)
+
         # last
         x = self.norm_out(x, octree, depth)
         x = F.silu(x)
         
-        # GGCA: enrich ALL features with text+geometry conditioning at conv_out entrance.
+        # GGCA@64: enrich ALL features with text+geometry conditioning at conv_out entrance.
         # This allows text-conditioned information to flow into all output heads
         # (albedo, roughness, metallic, opacity, scale) through the shared conv_out.
-        ggca_cond = condition_ggca if condition_ggca is not None else condition
         if self.ggca is not None and ggca_cond is not None:
             if self.use_checkpoint:
                 x = checkpoint(self.ggca, x, octree, depth, ggca_cond, normals, use_reentrant=False)

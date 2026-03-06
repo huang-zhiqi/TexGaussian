@@ -111,6 +111,7 @@ def main():
     opt.use_text_adapter = str2bool(opt.use_text_adapter)
     opt.freeze_base = str2bool(opt.freeze_base)
     opt.unfreeze_attn_kv = str2bool(opt.unfreeze_attn_kv)
+    opt.unfreeze_attn_qo = str2bool(opt.unfreeze_attn_qo)
     opt.unfreeze_norms = str2bool(opt.unfreeze_norms)
     opt.use_text = str2bool(opt.use_text)
     opt.use_longclip = str2bool(opt.use_longclip)
@@ -303,6 +304,9 @@ def main():
         head_params = []
         if hasattr(model, "model") and hasattr(model.model, "ggca") and model.model.ggca is not None:
             head_params += list(model.model.ggca.parameters())
+        if hasattr(model, "model") and hasattr(model.model, "ggca_mid") and model.model.ggca_mid is not None:
+            head_params += list(model.model.ggca_mid.parameters())
+            accelerator.print(f"[INFO] Including ggca_mid in head_params (GGCA@512 at up_blocks.1)")
         if hasattr(model, "text_adapter") and model.text_adapter is not None:
             head_params += list(model.text_adapter.parameters())
         if hasattr(model, "model"):
@@ -331,6 +335,22 @@ def main():
                     adapt_param_ids.add(id(param))
                     kv_count += 1
             accelerator.print(f"[INFO] Unfreezing {kv_count} CA K,V projection tensors ({sum(p.numel() for p in adapt_params):,} params)")
+
+        if opt.unfreeze_attn_qo and hasattr(model, "model"):
+            # Unfreeze Q and O projection weights of all CrossAttention layers
+            # Q_proj: lets 3D features learn how to query long text (248 tokens)
+            # O_proj: lets attention results be properly written back to the feature stream
+            # Together with K,V this gives full attention adaptation freedom.
+            qo_count = 0
+            for name, param in model.model.named_parameters():
+                if id(param) in head_param_ids or id(param) in adapt_param_ids:
+                    continue  # skip GGCA's own Q,O and already-tracked K,V
+                if ('cross_attn.q_proj' in name or 'cross_attn.out_proj' in name):
+                    adapt_params.append(param)
+                    adapt_param_ids.add(id(param))
+                    qo_count += 1
+            qo_numel = sum(p.numel() for p in adapt_params[-qo_count:]) if qo_count > 0 else 0
+            accelerator.print(f"[INFO] Unfreezing {qo_count} CA Q,O projection tensors ({qo_numel:,} params)")
 
         if opt.unfreeze_norms and hasattr(model, "model"):
             # Unfreeze all GroupNorm and LayerNorm affine parameters
