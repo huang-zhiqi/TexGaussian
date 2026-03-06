@@ -731,6 +731,118 @@ def write_result_manifest(tsv_path: str, rows):
     print(f"[INFO] Saved generated manifest to {tsv_path}")
 
 
+def check_sample_completed(textures_dir, obj_id):
+    """Check if a sample has all required output files (roughness, metallic, albedo, mesh)."""
+    sample_dir = os.path.join(textures_dir, obj_id)
+    required_files = ['roughness.png', 'metallic.png', 'albedo.png', 'mesh.obj']
+    return all(os.path.isfile(os.path.join(sample_dir, f)) for f in required_files)
+
+
+def append_to_manifest(tsv_path, new_rows):
+    """Append new rows to existing generated_manifest.tsv, avoiding duplicates."""
+    if not new_rows:
+        return
+
+    # Read existing rows
+    existing_ids = set()
+    existing_rows = []
+    if os.path.isfile(tsv_path):
+        with open(tsv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                existing_ids.add(row.get("obj_id", ""))
+                existing_rows.append(row)
+
+    # Filter new rows (skip duplicates)
+    rows_to_add = [r for r in new_rows if r["obj_id"] not in existing_ids]
+
+    if not rows_to_add:
+        print(f"[INFO] No new rows to append to manifest {tsv_path}")
+        return
+
+    # Determine fieldnames
+    all_rows = existing_rows + rows_to_add
+    fieldnames = ["obj_id", "mesh", "albedo", "rough", "metal", "normal"]
+    caption_fields = ["caption_short", "caption_long", "caption_used"]
+    for name in caption_fields:
+        if any(name in r for r in all_rows):
+            fieldnames.append(name)
+
+    tsv_dir = os.path.dirname(tsv_path) or "."
+    os.makedirs(tsv_dir, exist_ok=True)
+
+    with open(tsv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+    print(f"[INFO] Appended {len(rows_to_add)} new rows to manifest {tsv_path} (total: {len(all_rows)})")
+
+
+def merge_and_save_experiment_config(exp_dir, opt, new_processed, new_skipped=None,
+                                     manifest_path=None, timing_info=None):
+    """Merge new inference results into existing config.json, or create a new one."""
+    config_path = os.path.join(exp_dir, "config.json")
+
+    # Load existing config if present
+    existing_config = None
+    if os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            existing_config = json.load(f)
+
+    if existing_config is None:
+        # No existing config, save fresh
+        save_experiment_config(exp_dir, opt, new_processed, new_skipped,
+                               manifest_path, timing_info)
+        return
+
+    # --- Merge processed_samples ---
+    prev_processed = existing_config.get("processed_samples", [])
+    existing_ids = {s["obj_id"] for s in prev_processed}
+    for sample in new_processed:
+        if sample["obj_id"] not in existing_ids:
+            prev_processed.append(sample)
+            existing_ids.add(sample["obj_id"])
+    prev_processed.sort(key=lambda x: x["obj_id"])
+
+    # --- Merge skipped_samples ---
+    new_processed_ids = {s["obj_id"] for s in new_processed}
+    prev_skipped = existing_config.get("skipped_samples", [])
+    # Remove previously skipped that are now successfully processed
+    remaining_skipped = [s for s in prev_skipped if s["obj_id"] not in new_processed_ids]
+    # Add new skipped (avoid duplicates)
+    existing_skipped_ids = {s["obj_id"] for s in remaining_skipped}
+    for s in (new_skipped or []):
+        if s["obj_id"] not in existing_skipped_ids:
+            remaining_skipped.append(s)
+    remaining_skipped.sort(key=lambda x: x["obj_id"])
+
+    # --- Determine timing key: timing, timing2, timing3, ... ---
+    timing_key = "timing"
+    i = 2
+    while timing_key in existing_config:
+        timing_key = f"timing{i}"
+        i += 1
+
+    # --- Update config ---
+    existing_config["options"] = to_jsonable(opt)
+    existing_config["ckpt_path"] = opt.ckpt_path
+    existing_config["tsv_path"] = os.path.abspath(opt.tsv_path) if opt.tsv_path else None
+    existing_config["save_image"] = opt.save_image
+    existing_config["processed_samples"] = prev_processed
+    existing_config["skipped_samples"] = remaining_skipped
+    if manifest_path:
+        existing_config["result_tsv"] = os.path.abspath(manifest_path)
+    if timing_info:
+        existing_config[timing_key] = timing_info
+
+    os.makedirs(exp_dir, exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump(existing_config, f, indent=2)
+    print(f"[INFO] Updated config.json: {len(prev_processed)} processed, {len(remaining_skipped)} skipped, timing key: {timing_key}")
+
+
 def parse_gpu_ids(gpu_ids_str: str):
     """Parse GPU IDs from comma-separated string."""
     gpu_ids_str = gpu_ids_str.strip()
@@ -1167,8 +1279,28 @@ if __name__ == "__main__":
         print(f"[INFO] Using caption field: {opt.caption_field}")
         os.makedirs(textures_dir, exist_ok=True)
 
+        # --- Auto-skip: filter out samples that already have all output files ---
+        auto_skipped_ids = []
+        rows_to_process = []
+        for row in batch_rows:
+            obj_id = (row.get("obj_id") or "").strip()
+            if obj_id and check_sample_completed(textures_dir, obj_id):
+                auto_skipped_ids.append(obj_id)
+            else:
+                rows_to_process.append(row)
+
+        if auto_skipped_ids:
+            print(f"[INFO] Auto-skipped {len(auto_skipped_ids)} already-completed samples")
+            print(f"[INFO] Remaining samples to process: {len(rows_to_process)}")
+
+        batch_rows = rows_to_process
+
         total_workers = len(gpu_ids) * workers_per_gpu
-        if total_workers > 1 and len(batch_rows) > 1:
+        if len(batch_rows) == 0:
+            print(f"[INFO] All samples are already completed. Nothing to do.")
+            processed_samples = []
+            skipped_samples = []
+        elif total_workers > 1 and len(batch_rows) > 1:
             # Multi-worker mode (multiple GPUs and/or multiple workers per GPU)
             print(f"[INFO] Running in parallel mode: {len(gpu_ids)} GPUs x {workers_per_gpu} workers = {total_workers} total workers")
             processed_samples, skipped_samples = run_multi_gpu(
@@ -1184,7 +1316,7 @@ if __name__ == "__main__":
             )
 
         if processed_samples:
-            write_result_manifest(result_tsv_path, processed_samples)
+            append_to_manifest(result_tsv_path, processed_samples)
         
         # Calculate and display timing information
         inference_end_time = time.time()
@@ -1216,9 +1348,9 @@ if __name__ == "__main__":
         print(f"[TIMING] GPUs used: {len(gpu_ids)}, Workers per GPU: {workers_per_gpu}")
         print("="*60 + "\n")
         
-        save_experiment_config(output_dir, opt, processed_samples, skipped_samples, 
-                               manifest_path=result_tsv_path if processed_samples else None,
-                               timing_info=timing_info)
+        merge_and_save_experiment_config(output_dir, opt, processed_samples, skipped_samples, 
+                                        manifest_path=result_tsv_path if processed_samples else None,
+                                        timing_info=timing_info)
     else:
         # Single sample mode - always single GPU
         converter = Converter(opt).cuda()
@@ -1257,5 +1389,6 @@ if __name__ == "__main__":
         print("="*60 + "\n")
 
         processed_samples = [build_result_row(opt.texture_name, sample_output_dir)]
-        write_result_manifest(result_tsv_path, processed_samples)
-        save_experiment_config(output_dir, opt, processed_samples, manifest_path=result_tsv_path, timing_info=timing_info)
+        append_to_manifest(result_tsv_path, processed_samples)
+        merge_and_save_experiment_config(output_dir, opt, processed_samples,
+                                        manifest_path=result_tsv_path, timing_info=timing_info)
