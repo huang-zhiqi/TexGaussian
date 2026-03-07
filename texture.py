@@ -1308,7 +1308,8 @@ if __name__ == "__main__":
             )
         else:
             # Single-GPU single-worker mode
-            print(f"[INFO] Running in single-GPU mode")
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_ids[0])
+            print(f"[INFO] Running in single-GPU mode on GPU {gpu_ids[0]}")
             converter = Converter(opt).cuda()
             converter.load_ckpt(opt.ckpt_path)
             processed_samples, skipped_samples = run_single_gpu(
@@ -1353,6 +1354,8 @@ if __name__ == "__main__":
                                         timing_info=timing_info)
     else:
         # Single sample mode - always single GPU
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_ids[0])
+        print(f"[INFO] Running single sample mode on GPU {gpu_ids[0]}")
         converter = Converter(opt).cuda()
         converter.load_ckpt(opt.ckpt_path)
         
