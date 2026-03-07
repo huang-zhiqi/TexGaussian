@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="texverse_stage1_new_modules_v6"
+EXP_NAME="texverse_stage1_new_modules_v10"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -41,12 +41,12 @@ USE_LONGCLIP="True"
 
 # 最大处理样本数 (-1 表示处理所有样本)
 # 用于快速测试或部分推理
-MAX_SAMPLES=20
+MAX_SAMPLES=-1
 
 # 预训练权重路径
 # CKPT_PATH="./assets/ckpts/PBR_model.safetensors"
 #训练得到的权重路径
-CKPT_PATH="../experiments/texverse_stage1_new_modules_v6/2026.02.25-02:22:08_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
+CKPT_PATH="../experiments/texverse_stage1_new_modules_v10/2026.03.05-15:38:31_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
 
 # 新增分支开关
 USE_GGCA="True"  # Geometry-Gated Cross-Attention
@@ -58,14 +58,15 @@ USE_TEXT_ADAPTER="True"  # Text Adapter for LongCLIP
 # WORKERS_PER_GPU: 每张GPU上并行运行的进程数
 #   - "auto": 根据GPU显存自动计算最优值 (推荐)
 #   - 数字 (如 "2"): 手动指定固定数量
-# GPU_IDS="0,1"
-# NUM_GPUS=2
-# WORKERS_PER_GPU="auto"
+GPU_IDS="0,1"
+NUM_GPUS=2
+WORKERS_PER_GPU=2
 
 # 4卡配置 (解开注释使用)
-GPU_IDS="0,1,2,3"
-NUM_GPUS=4
-WORKERS_PER_GPU="auto"
+# GPU_IDS="0,1,2,3"
+# GPU_IDS="3,4,5,6"
+# NUM_GPUS=4
+# WORKERS_PER_GPU=2
 
 # ==========================================
 
@@ -81,6 +82,12 @@ echo "Use Text Adapter: ${USE_TEXT_ADAPTER}"
 echo "GPU IDs: ${GPU_IDS}, Num GPUs: ${NUM_GPUS}, Workers/GPU: ${WORKERS_PER_GPU}"
 echo "Total parallel workers: $((NUM_GPUS * WORKERS_PER_GPU))"
 echo "Textures will be stored under: ${OUTPUT_ROOT}/textures"
+
+# 单GPU时直接设置 CUDA_VISIBLE_DEVICES（必须在 python 启动前设置）
+if [ "${NUM_GPUS}" -eq 1 ]; then
+    export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+    echo "Single GPU mode: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+fi
 
 python3 texture.py objaverse \
 --tsv-path "${BATCH_TSV}" \
