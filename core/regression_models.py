@@ -59,8 +59,8 @@ class TextAdapter(nn.Module):
     def __init__(
         self, 
         embed_dim: int = 768, 
-        hidden_dim: int = 256,
-        num_layers: int = 2,
+        hidden_dim: int = 512,
+        num_layers: int = 3,
         dropout: float = 0.1,
         residual_scale: float = 0.1,
     ):
