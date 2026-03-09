@@ -307,24 +307,6 @@ def main():
         if hasattr(model, "model") and hasattr(model.model, "ggca_mid") and model.model.ggca_mid is not None:
             head_params += list(model.model.ggca_mid.parameters())
             accelerator.print(f"[INFO] Including ggca_mid in head_params (GGCA@512 at up_blocks.1)")
-        if hasattr(model, "model") and hasattr(model.model, "ggca_up2") and model.model.ggca_up2 is not None:
-            head_params += list(model.model.ggca_up2.parameters())
-            accelerator.print(f"[INFO] Including ggca_up2 in head_params (GGCA@256 at up_blocks.2)")
-        if hasattr(model, "model") and hasattr(model.model, "ggca_up3") and model.model.ggca_up3 is not None:
-            head_params += list(model.model.ggca_up3.parameters())
-            accelerator.print(f"[INFO] Including ggca_up3 in head_params (GGCA@128 at up_blocks.3)")
-        if hasattr(model, "model") and hasattr(model.model, "ggca_enc2") and model.model.ggca_enc2 is not None:
-            head_params += list(model.model.ggca_enc2.parameters())
-            accelerator.print(f"[INFO] Including ggca_enc2 in head_params (Encoder GGCA@256 at down[2] exit)")
-        if hasattr(model, "model") and hasattr(model.model, "text_pool") and model.model.text_pool is not None:
-            head_params += list(model.model.text_pool.parameters())
-            accelerator.print(f"[INFO] Including text_pool in head_params (LearnedTextPool for FiLM)")
-        if hasattr(model, "model") and hasattr(model.model, "skip_films") and model.model.skip_films is not None:
-            film_dims = []
-            for film_key, film_module in model.model.skip_films.items():
-                head_params += list(film_module.parameters())
-                film_dims.append(film_key)
-            accelerator.print(f"[INFO] Including skip_films in head_params (FiLM@{','.join(film_dims)})")
         if hasattr(model, "text_adapter") and model.text_adapter is not None:
             head_params += list(model.text_adapter.parameters())
         if hasattr(model, "model"):

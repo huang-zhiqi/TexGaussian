@@ -475,96 +475,6 @@ class UpBlock(nn.Module):
         return x
 
 
-class LearnedTextPool(nn.Module):
-    """
-    Learnable attention pooling over text tokens.
-    
-    Replaces naive mean pooling with a learned weighted sum:
-        weights = softmax(MLP(tokens))   # [B, seq_len, 1]
-        pooled = sum(weights * tokens)    # [B, dim]
-    
-    Initialized to uniform weights (≈ mean pooling) via zero-init on output layer,
-    so it starts as near-identity and gradually learns to focus on material-relevant tokens.
-    
-    Args:
-        dim: Text embedding dimension (768 for CLIP/LongCLIP)
-        hidden_dim: Hidden dimension of the scoring MLP
-    """
-    def __init__(self, dim: int = 768, hidden_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        # Init: Xavier for gradient flow, small gain on output → near-uniform weights → ≈ mean pooling
-        # Zero-init would cause gradient deadlock (∂L/∂W_first = ... × W_last^T = 0)
-        nn.init.xavier_uniform_(self.net[0].weight)
-        nn.init.zeros_(self.net[0].bias)
-        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
-        nn.init.zeros_(self.net[-1].bias)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, seq_len, dim] text embeddings
-        Returns:
-            pooled: [B, dim]
-        """
-        weights = torch.softmax(self.net(x), dim=1)  # [B, seq_len, 1]
-        return (weights * x).sum(dim=1)  # [B, dim]
-
-
-class SkipFiLM(nn.Module):
-    """
-    Feature-wise Linear Modulation (FiLM) for text-blind skip connections.
-    
-    Applies a text-conditioned per-channel affine transform:
-        output = skip + scale * (γ(text) ⊙ skip + β(text))
-    
-    where γ and β are produced by a small MLP from pooled text embeddings.
-    Initialized near-identity: small Xavier on output layer + learnable scale=0.1,
-    so initial contribution is ~0.1 * small ≈ 0% perturbation.
-    
-    Args:
-        feature_dim: Channel dimension of skip connection features
-        context_dim: Text embedding dimension (768 for CLIP/LongCLIP)
-        hidden_dim: Hidden dimension of the FiLM MLP
-    """
-    def __init__(self, feature_dim: int, context_dim: int = 768, hidden_dim: int = 128):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(0.1))
-        self.net = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, feature_dim * 2),  # [γ || β]
-        )
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Xavier init for gradient flow; small gain on output for near-identity start."""
-        nn.init.xavier_uniform_(self.net[0].weight)
-        nn.init.zeros_(self.net[0].bias)
-        nn.init.xavier_uniform_(self.net[-1].weight, gain=0.01)
-        nn.init.zeros_(self.net[-1].bias)
-    
-    def forward(self, skip_features: torch.Tensor, text_pooled: torch.Tensor,
-                batch_id: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            skip_features: [N, feature_dim] per-point skip features
-            text_pooled: [B, context_dim] pooled text embedding (mean over seq_len)
-            batch_id: [N] per-point batch assignment
-        Returns:
-            modulated: [N, feature_dim]
-        """
-        gamma_beta = self.net(text_pooled)  # [B, feature_dim * 2]
-        gamma, beta = gamma_beta.chunk(2, dim=-1)  # each [B, feature_dim]
-        gamma = gamma[batch_id]  # [N, feature_dim]
-        beta = beta[batch_id]    # [N, feature_dim]
-        return skip_features + self.scale * (gamma * skip_features + beta)
-
-
 class OctreeUNet(nn.Module):
     def __init__(
         self,
@@ -660,29 +570,10 @@ class OctreeUNet(nn.Module):
         self.conv = ocnn.nn.OctreeConv(out_channels, out_channels, kernel_size=[3], nempty=True, use_bias=True)
 
         # GGCA: Geometry-Gated Cross-Attention (optional)
-        # v12: 全频谱文本条件 — 编码器 + 解码器 + skip connection 全面覆盖
-        #
-        # 编码器 (Encoder):
-        #   down[0]@64  depth=8: (无CA) → skip 由 FiLM@64 调制
-        #   down[1]@128 depth=7: (无CA) → skip 由 FiLM@128 调制
-        #   down[2]@256 depth=6: (无CA) → skip 由 FiLM@256 调制
-        #   ↓ ggca_enc2@256 (标量门) → 使 down[3]+CA 接收 text-aware 输入
-        #   down[3]@512 depth=5: 原生 CA
-        #   down[4]@512 depth=4: 原生 CA
-        #
-        # 解码器 (Decoder):
-        #   up[0]@512 depth 4→5: 原生 CA
-        #   up[1]@512 depth 5→6: 原生 CA → ggca_mid (标量门)
-        #   up[2]@256 depth 6→7: ─────────→ ggca_up2 (标量门)
-        #   up[3]@128 depth 7→8: ─────────→ ggca_up3 (几何门!)
-        #   up[4]@64  depth 8:   (无 CA)
-        #   output@64 depth 8:   ─────────→ ggca (几何门)
+        # Uses inner_dim projection so attention runs in a higher-dim space
+        # with reasonable head_dim (e.g. 32), then projects back to feature dim.
         self.ggca = None
         self.ggca_mid = None
-        self.ggca_up2 = None
-        self.ggca_up3 = None
-        self.ggca_enc2 = None
-        self.text_pool = None
         if use_ggca:
             ggca_inner = up_channels[-1] * 4   # 64 * 4 = 256
             ggca_heads = max(ggca_inner // 32, 1)  # head_dim=32 -> 8 heads
@@ -716,85 +607,6 @@ class OctreeUNet(nn.Module):
                     use_geometry_gate=False,  # no normals at coarse octree level
                 )
 
-            # GGCA@256: bridge the text-blind zone between 512-dim CA layers and output.
-            # Placed after up_blocks.2 (dim=256, depth=7). No normals at this depth.
-            up2_dim = up_channels[2]  # 256 for standard architecture
-            if up2_dim >= 128:
-                ggca_up2_heads = max(up2_dim // 32, 1)  # 256/32 = 8 heads
-                self.ggca_up2 = GeometryGatedCrossAttention(
-                    dim=up2_dim,
-                    num_heads=ggca_up2_heads,
-                    context_dim=context_dim,
-                    inner_dim=up2_dim,      # 256-dim, no projection needed
-                    ffn_mult=4.0,
-                    normal_dim=3,
-                    gate_bias=-2.0,
-                    output_scale=0.1,
-                    use_geometry_gate=False,  # depth 7, no normals
-                )
-
-            # GGCA@128: fine-detail text conditioning with geometry gate.
-            # Placed after up_blocks.3 (dim=128, depth=8). Normals ARE available
-            # at depth 8, so this uses real geometry gating like GGCA@64.
-            up3_dim = up_channels[3]  # 128 for standard architecture
-            if up3_dim >= 64:
-                ggca_up3_inner = max(up3_dim * 2, 256)  # project up to 256 for capacity
-                ggca_up3_heads = max(ggca_up3_inner // 32, 1)  # 256/32 = 8 heads
-                self.ggca_up3 = GeometryGatedCrossAttention(
-                    dim=up3_dim,
-                    num_heads=ggca_up3_heads,
-                    context_dim=context_dim,
-                    inner_dim=ggca_up3_inner,
-                    ffn_mult=4.0,
-                    normal_dim=3,
-                    gate_bias=-2.0,
-                    output_scale=0.1,
-                    use_geometry_gate=True,  # depth 8: normals available!
-                )
-
-            # Encoder GGCA@256: genuine text-aware features at the encoder's text-blind/CA boundary.
-            # After down[2]@256 downsamples to depth=5, apply cross-attention so that:
-            #   1) down[3]+CA receives text-enriched input (better CA quality)
-            #   2) The main encoder stream carries text information deeper
-            # FiLM handles per-channel modulation of skip connections;
-            # encoder GGCA creates genuinely new cross-modal representations.
-            enc2_dim = down_channels[2]  # 256 for standard architecture
-            if enc2_dim >= 128:
-                ggca_enc2_heads = max(enc2_dim // 32, 1)  # 256/32 = 8 heads
-                self.ggca_enc2 = GeometryGatedCrossAttention(
-                    dim=enc2_dim,
-                    num_heads=ggca_enc2_heads,
-                    context_dim=context_dim,
-                    inner_dim=enc2_dim,
-                    ffn_mult=4.0,
-                    normal_dim=3,
-                    gate_bias=-2.0,
-                    output_scale=0.1,
-                    use_geometry_gate=False,  # depth 5, no normals
-                )
-
-            # Learned text pooling for FiLM: replaces naive mean pooling.
-            # Different tokens carry different material/color information;
-            # learnable attention weighting focuses on relevant tokens.
-            # Initialized to uniform weights (≈ mean pooling) for safe startup.
-            self.text_pool = LearnedTextPool(dim=context_dim, hidden_dim=128)
-
-            # Skip Connection FiLM: text-conditioned modulation for text-blind skip connections.
-            # Applied to skip features from encoder blocks WITHOUT CrossAttention.
-            # Each FiLM module handles a specific channel dimension (64, 128, 256).
-            # Shared across depths: FiLM@64 handles all 64-dim skips regardless of octree depth.
-            self.skip_films = nn.ModuleDict()
-            seen_dims = set()
-            for dim_idx, has_attn in enumerate(down_attention):
-                if not has_attn:
-                    dim = down_channels[dim_idx]
-                    if dim not in seen_dims:
-                        seen_dims.add(dim)
-                        self.skip_films[str(dim)] = SkipFiLM(
-                            feature_dim=dim,
-                            context_dim=context_dim,
-                        )
-
     def forward(self, x, octree, condition = None, normals: Optional[torch.Tensor] = None, condition_ggca: Optional[torch.Tensor] = None):
         # x: [N, Cin] where N is number of non-empty octree nodes
         # normals: [N, 3] mesh normals for GGCA geometry gate (optional)
@@ -811,57 +623,23 @@ class OctreeUNet(nn.Module):
         else:
             x = self.conv_in(x, octree, depth)
         
-        # Precompute adapted text conditioning for GGCA/FiLM
-        ggca_cond = condition_ggca if condition_ggca is not None else condition
-
         # down
         xss = [x]
-        for enc_i, (block, downsample) in enumerate(zip(self.down_blocks, self.downsample)):
+        for block, downsample in zip(self.down_blocks, self.downsample):
             x, xs = block(x, octree, depth, condition)
             xss.extend(xs)
 
             if downsample:
                 depth -= 1
-
-            # Encoder GGCA@256: inject text into main stream after down[2] downsample.
-            # x is now at depth=5 (256-dim), about to enter down[3]+CA.
-            # This makes CA's input text-aware, improving cross-attention quality.
-            if enc_i == 2 and self.ggca_enc2 is not None and ggca_cond is not None:
-                if self.use_checkpoint:
-                    x = checkpoint(self.ggca_enc2, x, octree, depth, ggca_cond, None, use_reentrant=False)
-                else:
-                    x = self.ggca_enc2(x, octree, depth, ggca_cond, None)
         
         # mid
         x = self.mid_block(x, octree, depth, condition)
 
         # up
-        # FiLM: precompute pooled text for skip connection modulation
-        has_film = (self.skip_films is not None and len(self.skip_films) > 0
-                    and ggca_cond is not None)
-        if has_film and self.text_pool is not None:
-            text_pooled = self.text_pool(ggca_cond)  # learned attention pooling [B, dim]
-        elif has_film:
-            text_pooled = ggca_cond.mean(dim=1)  # fallback to mean pooling
-        else:
-            text_pooled = None
-
+        ggca_cond = condition_ggca if condition_ggca is not None else condition
         for i, (block, upsample) in enumerate(zip(self.up_blocks, self.upsample)):
             xs = xss[-len(block.nets):]
             xss = xss[:-len(block.nets)]
-
-            # FiLM: modulate text-blind skip connections before UpBlock consumes them.
-            # Only applies to dims with a registered FiLM module (64, 128, 256);
-            # 512-dim skips from CA-enabled encoder blocks are left unchanged.
-            if has_film:
-                batch_id = octree.batch_id(depth=depth, nempty=True)
-                xs = [
-                    self.skip_films[str(s.shape[1])](s, text_pooled, batch_id)
-                    if str(s.shape[1]) in self.skip_films
-                    else s
-                    for s in xs
-                ]
-
             x = block(x, xs, octree, depth, condition)
 
             if upsample:
@@ -875,22 +653,6 @@ class OctreeUNet(nn.Module):
                     x = checkpoint(self.ggca_mid, x, octree, depth, ggca_cond, None, use_reentrant=False)
                 else:
                     x = self.ggca_mid(x, octree, depth, ggca_cond, None)
-
-            # GGCA@256: bridge text-blind zone at dim=256, depth=7.
-            # Scalar gate (no normals at depth 7).
-            if i == 2 and self.ggca_up2 is not None and ggca_cond is not None:
-                if self.use_checkpoint:
-                    x = checkpoint(self.ggca_up2, x, octree, depth, ggca_cond, None, use_reentrant=False)
-                else:
-                    x = self.ggca_up2(x, octree, depth, ggca_cond, None)
-
-            # GGCA@128: fine-detail text conditioning at dim=128, depth=8.
-            # Geometry gate with real normals (depth 8 = input depth).
-            if i == 3 and self.ggca_up3 is not None and ggca_cond is not None:
-                if self.use_checkpoint:
-                    x = checkpoint(self.ggca_up3, x, octree, depth, ggca_cond, normals, use_reentrant=False)
-                else:
-                    x = self.ggca_up3(x, octree, depth, ggca_cond, normals)
 
         # last
         x = self.norm_out(x, octree, depth)
