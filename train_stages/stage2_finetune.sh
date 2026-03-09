@@ -27,11 +27,11 @@ export CUDA_LAUNCH_BLOCKING=0
 # 阶段2 特定配置
 # =========================
 STAGE_NAME="Stage2_Full_Finetune"
-EXP_NAME="texverse_stage2_finetune"
+EXP_NAME="texverse_stage2_finetune_v11"
 WORKSPACE="${EXPERIMENTS_ROOT}/${EXP_NAME}"
 
 # 从阶段1的checkpoint继续
-STAGE1_WORKSPACE="${EXPERIMENTS_ROOT}/texverse_stage1_new_modules_v6"
+STAGE1_WORKSPACE="${EXPERIMENTS_ROOT}/texverse_stage1_new_modules_v11"
 
 # 自动查找最新的 checkpoint（按修改时间排序）
 find_latest_ckpt() {
@@ -103,11 +103,21 @@ USE_TEXT_ADAPTER="True"
 USE_GGCA="True"
 FREEZE_BASE="False"         # ⚠️ 关键：解冻基础模型！
 
+# 解冻开关 - 与 Stage1 保持一致（仍需要三层参数分组）
+UNFREEZE_ATTN_KV="True"    # CA K,V 投影
+UNFREEZE_ATTN_QO="True"    # CA Q,O 投影
+UNFREEZE_NORMS="True"      # GroupNorm/LayerNorm
+ADAPT_LR_SCALE=0.1         # Tier 2 相对 Tier 1 的学习率比例
+
 # 优化配置 - 使用较低学习率避免破坏预训练权重
-BATCH_SIZE=1
-GRAD_ACC=4                 # 有效batch = 1 * NUM_GPUS * 4
-NUM_EPOCHS=20              # 适度训练，增加 epoch 让 base 充分适配
-LR=5e-5                    # ⚠️ 较低学习率
+BATCH_SIZE=4               # 3090 24GB 足以支持 BS=2（Stage1 用 BS=4, ~8GB 显存）
+GRAD_ACC=1                 # 有效batch = 2 * NUM_GPUS * 2 = 16（与 Stage1 一致）
+NUM_EPOCHS=10              # 全模型微调过拟合风险高，10 epoch 较安全
+LR=1e-4                    # Tier 1 (新模块) 学习率
+                            # Tier 2 (CA K/V/Q/O+norms): LR*0.1 = 1e-5
+                            # Tier 3 (backbone): LR*0.01 = 1e-6（main.py 硬编码）
+LAMBDA_LPIPS=2.0           # 与 Stage1 保持一致
+EMA_RATE=0.9999            # 与 Stage1 保持一致
 
 # =========================
 # 验证并打印配置
@@ -143,7 +153,11 @@ echo "  Resume Mode: ${RESUME_MODE} (stage2=恢复训练, stage1=新训练)"
 echo "  TextAdapter: ${USE_TEXT_ADAPTER}"
 echo "  GGCA: ${USE_GGCA}"
 echo "  Freeze Base: ${FREEZE_BASE}"
-echo "  Learning Rate: ${LR} (低学习率)"
+echo "  Unfreeze K,V: ${UNFREEZE_ATTN_KV}"
+echo "  Unfreeze Q,O: ${UNFREEZE_ATTN_QO}"
+echo "  Unfreeze Norms: ${UNFREEZE_NORMS}"
+echo "  Adapt LR Scale: ${ADAPT_LR_SCALE}"
+echo "  Learning Rate: ${LR} (Tier1=${LR}, Tier2=${LR}*${ADAPT_LR_SCALE}, Tier3=${LR}*0.01)"
 echo "  Epochs: ${NUM_EPOCHS}"
 echo ""
 
@@ -182,6 +196,12 @@ ARGS=(
   --use_ggca "${USE_GGCA}"
   --use_text_adapter "${USE_TEXT_ADAPTER}"
   --freeze_base "${FREEZE_BASE}"
+  --unfreeze_attn_kv "${UNFREEZE_ATTN_KV}"
+  --unfreeze_attn_qo "${UNFREEZE_ATTN_QO}"
+  --unfreeze_norms "${UNFREEZE_NORMS}"
+  --adapt_lr_scale "${ADAPT_LR_SCALE}"
+  --lambda_lpips "${LAMBDA_LPIPS}"
+  --ema_rate "${EMA_RATE}"
   --resume "${RESUME_CKPT}"
 )
 

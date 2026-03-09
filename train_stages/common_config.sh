@@ -28,11 +28,12 @@ export CUDA_LAUNCH_BLOCKING=0
 # GPU 配置 (根据你的显卡数量调整)
 # =========================
 # 2卡配置
-# GPU_IDS="0,1"
+# GPU_IDS="4,5"
 # NUM_GPUS=2
 
-# 4卡配置 (解开注释使用)
-GPU_IDS="0,1,2,3"
+# # 4卡配置 (解开注释使用)
+# GPU_IDS="1,2,3,4"
+GPU_IDS="3,4,5,6"
 NUM_GPUS=4
 
 ACC_CONFIG="acc_configs/gpu${NUM_GPUS}.yaml"

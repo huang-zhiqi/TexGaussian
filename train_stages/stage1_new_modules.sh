@@ -1,24 +1,47 @@
 #!/bin/bash
 # =============================================================================
-# 阶段1：训练新增模块（TextAdapter + GGCA）
+# v10 —— 新模块训练 (GGCA + TextAdapter)
 # =============================================================================
-# 目标：冻结预训练 UNet backbone，训练新引入的模块
-#   - TextAdapter: 单一embedding流，同时适配 LongCLIP 到 CrossAttention 和 GGCA
-#   - GGCA: Geometry-Gated Cross-Attention，放在 conv_out 入口，enriches ALL features
+# 双层文本注入：解码器 GGCA ×2 + TextAdapter
 #
-# 前置条件：预训练基础 PBR 模型 (PBR_model.safetensors)
-# 预期时间：20 epochs，约 2-3 小时（2卡3090）
-# 新增模块总参数：~1.48M（TextAdapter 394K + GGCA 1.09M）
+# ┌─────────────────────────────────────────────────────────────────┐
+# │  编码器 (Encoder)                                              │
+# │  down[0]@64 d8 : (无CA)────→ skip ──────────→ up[4]           │
+# │  down[1]@128 d7: (无CA)────→ skip ──────────→ up[3]           │
+# │  down[2]@256 d6: (无CA)────→ skip ──────────→ up[2]           │
+# │  down[3]@512 d5: 原生CA                                       │
+# │  down[4]@512 d4: 原生CA                                       │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  Mid: 原生CA@512 d4                                            │
+# ├─────────────────────────────────────────────────────────────────┤
+# │  解码器 (Decoder)                                              │
+# │  up[0]@512 d4→5: 原生CA                                       │
+# │  up[1]@512 d5→6: 原生CA → GGCA@512(标量门, ~3.41M)           │
+# │  up[2]@256 d6→7: (无CA)                                       │
+# │  up[3]@128 d7→8: (无CA)                                       │
+# │  up[4]@64  d8  : (无CA)                                       │
+# │  output@64 d8  : ─────→ GGCA@64(几何门, ~1.09M)              │
+# └─────────────────────────────────────────────────────────────────┘
 #
-# v2 优化策略：
-#   - 单一embedding流（TextAdapter适配所有路径）
-#   - GGCA 在 conv_out 入口（enriches ALL output features）
-#   - LPIPS权重 2.0（直接改善FID/KID）
-#   - EMA rate 0.9999（小参数量更平滑的指数平均）
-#   - gate_bias 0.0（GGCA更快发挥作用）
-#   - epoch 20（避免过拟合）
-#   - LPIPS loss 改用 pred_alphas 加权（和 MSE 一致，空洞由 mask_loss 处理）
-#   - 不输出法线，渲染时直接使用 mesh 法线
+# TextAdapter (394K): 768→256→768, 2层, 残差缩放=0.1
+#   LongCLIP 特征适配，统一文本流 → CA + GGCA
+#
+# 三层参数分组（base 冻结）：
+#   Tier 1（head, 全量LR=4e-4）：新增模块 ~4.9M
+#     - GGCA@64 (1.09M): 输出层几何门融合
+#     - GGCA@512 (3.41M): 解码器高维文本融合
+#     - TextAdapter (394K): LongCLIP 文本适配
+#     - conv_out + conv (20K)
+#   Tier 2（adapt, 0.1×LR=4e-5）：~15.8M
+#     - CA K+V+Q+O (15.7M) + Norms (0.07M)
+#   Tier 3（base）：~274M  [冻结！保护预训练特征]
+#
+# v10 训练配置:
+#   - NUM_EPOCHS=20
+#   - GRAD_ACC=1: 无梯度累积
+#   - LAMBDA_LPIPS=2.0: 感知损失权重
+#   - ADAPT_LR_SCALE=0.1: CA 层用 0.1× 学习率
+#   - gradient_clip=1.0
 # =============================================================================
 
 set -e
@@ -35,8 +58,8 @@ export CUDA_LAUNCH_BLOCKING=0
 # =========================
 # 阶段1 特定配置
 # =========================
-STAGE_NAME="Stage1_New_Modules"
-EXP_NAME="texverse_stage1_new_modules_v6"
+STAGE_NAME="v10_new_modules"
+EXP_NAME="texverse_stage1_new_modules_v10"
 WORKSPACE="${EXPERIMENTS_ROOT}/${EXP_NAME}"
 
 # 自动查找最新的 checkpoint（支持多个来源）
@@ -117,18 +140,23 @@ else
   echo "[INFO] 从预训练模型开始新的 Stage1 训练"
 fi
 
-# 特征开关 - 启用所有新模块，冻结 base
-USE_TEXT_ADAPTER="True"    # LongCLIP 特征适配（单一embedding流，同时适配CrossAttention和GGCA）
-USE_GGCA="True"            # Geometry-Gated Cross-Attention（conv_out入口，enriches ALL features）
-FREEZE_BASE="True"         # 冻结基础模型，只训练 GGCA/TextAdapter
+# 特征开关 — v10
+USE_TEXT_ADAPTER="True"    # LongCLIP 特征适配（768→256→768, 394K）
+USE_GGCA="True"            # GGCA×2（ggca@64 几何门 + ggca_mid@512 标量门）
+FREEZE_BASE="True"         # 冻结 base（保护预训练特征）
+UNFREEZE_ATTN_KV="True"   # 解冻 CA K,V 投影
+UNFREEZE_ATTN_QO="True"   # 解冻 CA Q,O 投影
+UNFREEZE_NORMS="True"     # 解冻所有 GroupNorm/LayerNorm
+ADAPT_LR_SCALE=0.1        # CA+Norms 用 0.1× 学习率
+GRADIENT_CLIP=1.0          # 梯度裁剪阈值
 
 # 优化配置
-BATCH_SIZE=1
-GRAD_ACC=4                 # 有效batch = 1 * NUM_GPUS * 4
-NUM_EPOCHS=20              # 20 epochs足够（避免过拟合）
-LR=4e-4                    # 标准学习率
-LAMBDA_LPIPS=2.0           # LPIPS感知损失权重（直接提升FID/KID）
-EMA_RATE=0.9999            # EMA平滑率（小参数量下需要更平滑的平均）
+BATCH_SIZE=4
+GRAD_ACC=1                 # 无梯度累积
+NUM_EPOCHS=20
+LR=4e-4
+LAMBDA_LPIPS=2.0           # LPIPS感知损失权重
+EMA_RATE=0.9999
 
 # =========================
 # 验证并打印配置
@@ -155,11 +183,17 @@ fi
 print_stage_info "${STAGE_NAME}" "${WORKSPACE}" "${RESUME_CKPT}"
 
 echo "  Resume Mode: ${RESUME_MODE} (stage1=恢复训练, pretrained=新训练)"
-echo "  TextAdapter: ${USE_TEXT_ADAPTER} (单一embedding流，同时适配CA+GGCA)"
-echo "  GGCA: ${USE_GGCA} (conv_out入口)"
-echo "  Freeze Base: ${FREEZE_BASE}"
+echo "  TextAdapter: ${USE_TEXT_ADAPTER} (768→256→768, 394K)"
+echo "  GGCA: ${USE_GGCA} (ggca@64 几何门 + ggca_mid@512 标量门, ~4.5M)"
+echo "  Freeze Base: ${FREEZE_BASE} (base 冻结，保护预训练特征)"
+echo "  Unfreeze K,V: ${UNFREEZE_ATTN_KV} (12层 CA 的 K,V 投影 → 9.4M params)"
+echo "  Unfreeze Q,O: ${UNFREEZE_ATTN_QO} (12层 CA 的 Q,O 投影 → 6.3M params)"
+echo "  Unfreeze Norms: ${UNFREEZE_NORMS} (所有 GroupNorm/LayerNorm → 0.07M params)"
+echo "  Adapt LR Scale: ${ADAPT_LR_SCALE} (CA+Norms 学习率 = LR × ${ADAPT_LR_SCALE})"
+echo "  Gradient Clip: ${GRADIENT_CLIP}"
 echo "  lambda_lpips: ${LAMBDA_LPIPS}"
 echo "  ema_rate: ${EMA_RATE}"
+echo "  Grad Accumulation: ${GRAD_ACC} (effective batch = BATCH_SIZE × NUM_GPUS × GRAD_ACC)"
 echo "  Learning Rate: ${LR}"
 echo "  Epochs: ${NUM_EPOCHS}"
 echo ""
@@ -258,8 +292,13 @@ ARGS=(
   --use_ggca "${USE_GGCA}"
   --use_text_adapter "${USE_TEXT_ADAPTER}"
   --freeze_base "${FREEZE_BASE}"
+  --unfreeze_attn_kv "${UNFREEZE_ATTN_KV}"
+  --unfreeze_attn_qo "${UNFREEZE_ATTN_QO}"
+  --unfreeze_norms "${UNFREEZE_NORMS}"
+  --adapt_lr_scale "${ADAPT_LR_SCALE}"
   --lambda_lpips "${LAMBDA_LPIPS}"
   --ema_rate "${EMA_RATE}"
+  --gradient_clip "${GRADIENT_CLIP}"
   --resume "${RESUME_CKPT}"
 )
 
@@ -274,10 +313,13 @@ if [[ "${RESUME_MODE}" == "stage1" ]]; then
   fi
 fi
 
-echo "[INFO] Starting Stage 1 Training..."
+echo "[INFO] Starting v10 Training..."
 echo "[INFO] Memory optimization: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
-echo "[INFO] Gradient accumulation: ${GRAD_ACC}"
-echo "[INFO] Trainable modules: TextAdapter(394K) + GGCA(1.09M) = ~1.48M params"
+echo "[INFO] Effective batch = ${BATCH_SIZE} × ${NUM_GPUS} × ${GRAD_ACC} = $((BATCH_SIZE * NUM_GPUS * GRAD_ACC))"
+echo "[INFO] Tier 1 (head, LR=${LR}): GGCA@64(1.09M) + GGCA@512(3.41M) + TextAdapter(394K) + conv(20K) ≈ 4.9M"
+echo "[INFO] Tier 2 (adapt, LR=${LR}×${ADAPT_LR_SCALE}): CA K,V,Q,O(15.7M) + Norms(0.07M)"
+echo "[INFO] Tier 3 (base): FROZEN (~274M)"
+echo "[INFO] Trainable: ~20.7M params (Tier 1 + Tier 2)"
 
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" accelerate launch "${ARGS[@]}" \
   2> >(grep -v -E '^libpng warning: eXIf: duplicate$' >&2)
@@ -294,8 +336,8 @@ fi
 # =========================
 echo ""
 echo "=============================================="
-echo " 阶段1训练完成！"
-echo "=============================================="
+echo " v10 训练完成！"
+echo "==============================================" 
 echo ""
 echo " 检查要点:"
 echo "   1. albedo 颜色是否正确"
@@ -303,7 +345,5 @@ echo "   2. albedo_loss / material_loss 稳步下降"
 echo "   3. PSNR 达到 22-25"
 echo ""
 echo " 下一步:"
-echo "   a) 使用当前模型进行推理"
-echo "   b) 运行阶段2进行全模型微调（可选）:"
-echo "      ./train_stages/stage2_finetune.sh"
-echo "=============================================="
+echo "   a) 使用当前模型进行推理和评估"
+echo "   b) 或进行 Stage2 微调"

@@ -17,6 +17,8 @@
 # FID                     ↓  Fréchet Inception Distance，越小分布越接近
 # KID_mean                ↓  Kernel Inception Distance，越小越好
 # KID_std                 -  KID的标准差，仅供参考
+# CLIP_FID                ↓  基于CLIP特征的FID (clean-fid)，比Inception FID更贴近感知质量
+# CMMD                    ↓  CLIP Maximum Mean Discrepancy，不假设高斯分布，小样本下更稳定
 #
 # === Lit 语义指标 (CLIP相似度) ===
 # CLIP_Image_Similarity   ↑  图像级CLIP相似度 (Gen vs GT)
@@ -36,17 +38,38 @@
 # 不使用 set -e，防止脚本自动退出
 set -uo pipefail
 
+print_sep() {
+  echo "=============================================="
+}
+
 # 初始化 conda（非交互 shell 必须手动做）
-CONDA_BASE="$(conda info --base)"
+if ! command -v conda >/dev/null 2>&1; then
+  echo "[ERROR] conda command not found. Please install Conda or initialize your shell first."
+  exit 127
+fi
+
+if ! CONDA_BASE="$(CONDA_NO_PLUGINS=true conda info --base 2>/dev/null)"; then
+  echo "[ERROR] Failed to query Conda base path. Try: CONDA_NO_PLUGINS=true conda info --base"
+  exit 1
+fi
+
+if [ ! -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+  echo "[ERROR] Cannot find conda init script: $CONDA_BASE/etc/profile.d/conda.sh"
+  exit 1
+fi
+
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 ENV_NAME="${ENV_NAME:-metric}"
 set +u
-conda activate "$ENV_NAME"
+if ! conda activate "$ENV_NAME"; then
+  echo "[ERROR] Failed to activate conda env: $ENV_NAME"
+  exit 1
+fi
 set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高), GPU_ID环境变量选择GPU
-EXPERIMENT_NAME="${1:-texverse_stage1_new_modules_v8}"
+EXPERIMENT_NAME="${1:-texverse_stage1_new_modules_v10}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered_test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
 # If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will combine all images
@@ -72,16 +95,23 @@ PROMPTS_FILE="${PROMPTS_FILE:-"../experiments/${EXPERIMENT_NAME}/generated_manif
 CONSISTENCY_PAIRS="${CONSISTENCY_PAIRS:-10}"           # 每个物体采样的相邻视角对数量
 CONSISTENCY_CHANNEL="${CONSISTENCY_CHANNEL:-albedo}" # 一致性评估使用的通道: albedo/lit/normal
 
+# FID/KID 白色背景: 将 RGBA 图像合成到白色背景上再计算 FID/KID
+# 默认黑色背景下 ~80% 背景像素会主导 Inception 特征，开启后可降低背景噪声
+FID_WHITE_BG="${FID_WHITE_BG:-true}"
+
 # 启用 CUDA 同步调用（更稳定但更慢）
 export CUDA_LAUNCH_BLOCKING=1
 
 # 指标选择:
-# - 预设: all | pixel (psnr,ssim,lpips) | dist (fid,kid) | semantic (clip) | consistency (多视角)
-# - 自定义逗号列表: 例如 psnr,ssim,clip,consistency
+# - 预设: all | pixel (psnr,ssim,lpips) | dist (fid,kid,clip_fid,cmmd) | semantic (clip) | consistency (多视角)
+# - 自定义逗号列表: 例如 psnr,ssim,clip,clip_fid,cmmd,consistency
+# - 新增分布指标:
+#   CLIP_FID: 使用 CLIP 特征替代 Inception 的 FID (clean-fid, pip install clean-fid)
+#   CMMD: CLIP Maximum Mean Discrepancy (clip-mmd, pip install clip-mmd)
 # - 一致性指标包括: CrossView_LPIPS, CrossView_L1, Normal_Consistency, Reproj_L1 (需深度图)
 METRICS="${METRICS:-all}"
 
-echo "=============================================="
+print_sep
 echo "Evaluate Metrics"
 echo "Experiment:         $EXPERIMENT_NAME"
 echo "GT Dir:             $BASE_GT_DIR"
@@ -99,17 +129,18 @@ echo "Prompts file:       $PROMPTS_FILE"
 echo "Metrics:            $METRICS"
 echo "Consistency pairs:  $CONSISTENCY_PAIRS"
 echo "Consistency chan:   $CONSISTENCY_CHANNEL"
+echo "FID white bg:       $FID_WHITE_BG"
 echo "Output:             $OUTPUT"
 echo "GPU ID:             $GPU_ID"
 echo "Conda env:          $ENV_NAME"
-echo "=============================================="
+print_sep
 
 # 创建日志文件
 LOG_DIR="../experiments/${EXPERIMENT_NAME}/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/eval_metrics_$(date +%Y%m%d_%H%M%S).log"
 echo "Log file:      $LOG_FILE"
-echo "=============================================="
+print_sep
 
 # 设置 PyTorch 内存管理选项以提高稳定性
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -119,34 +150,45 @@ export TOKENIZERS_PARALLELISM="false"
 # export CUDA_LAUNCH_BLOCKING=1
 
 # 运行评估脚本，同时输出到终端和日志文件
-python -u scripts/eval_metrics.py \
-  --gpu "$GPU_ID" \
-  --experiment_name "$EXPERIMENT_NAME" \
-  --base_gt_dir "$BASE_GT_DIR" \
-  --base_gen_dir "$BASE_GEN_DIR" \
-  --lit_subdir "$LIT_SUBDIR" \
-  --unlit_subdir "$UNLIT_SUBDIR" \
-  --batch_size "$BATCH_SIZE" \
-  --device "$DEVICE" \
-  --kid_subset_size "$KID_SUBSET_SIZE" \
-  --clip_model "$CLIP_MODEL" \
-  --longclip_model "$LONGCLIP_MODEL" \
-  --longclip_root "$LONGCLIP_ROOT" \
-  --longclip_context_length "$LONGCLIP_CONTEXT_LENGTH" \
-  --prompts_file "$PROMPTS_FILE" \
-  --metrics "$METRICS" \
-  --consistency_pairs "$CONSISTENCY_PAIRS" \
-  --consistency_channel "$CONSISTENCY_CHANNEL" \
-  --output "$OUTPUT" \
-  2>&1 | tee "$LOG_FILE"
+# 使用数组构造命令，避免续行符误改导致 shell 把下一行当成新命令执行。
+EVAL_CMD=(
+  python -u scripts/eval_metrics.py
+  --gpu "$GPU_ID"
+  --experiment_name "$EXPERIMENT_NAME"
+  --base_gt_dir "$BASE_GT_DIR"
+  --base_gen_dir "$BASE_GEN_DIR"
+  --lit_subdir "$LIT_SUBDIR"
+  --unlit_subdir "$UNLIT_SUBDIR"
+  --batch_size "$BATCH_SIZE"
+  --device "$DEVICE"
+  --kid_subset_size "$KID_SUBSET_SIZE"
+  --clip_model "$CLIP_MODEL"
+  --longclip_model "$LONGCLIP_MODEL"
+  --longclip_root "$LONGCLIP_ROOT"
+  --longclip_context_length "$LONGCLIP_CONTEXT_LENGTH"
+  --prompts_file "$PROMPTS_FILE"
+  --metrics "$METRICS"
+  --consistency_pairs "$CONSISTENCY_PAIRS"
+  --consistency_channel "$CONSISTENCY_CHANNEL"
+  --output "$OUTPUT"
+)
+
+# 条件追加 --fid_white_bg 标志
+if [[ "$FID_WHITE_BG" == "true" || "$FID_WHITE_BG" == "True" || "$FID_WHITE_BG" == "1" ]]; then
+  EVAL_CMD+=(--fid_white_bg)
+fi
+
+"${EVAL_CMD[@]}" 2>&1 | tee "$LOG_FILE"
 
 EXIT_CODE=${PIPESTATUS[0]}
 
-echo "=============================================="
+print_sep
 if [ $EXIT_CODE -eq 0 ]; then
     echo "Evaluation complete!"
 else
     echo "Evaluation FAILED with exit code $EXIT_CODE"
     echo "Check log file: $LOG_FILE"
 fi
-echo "=============================================="
+print_sep
+
+exit "$EXIT_CODE"

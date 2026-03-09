@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="texverse_stage1_new_modules_v10"
+EXP_NAME="texverse_stage1_new_modules_v10_middle"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -41,7 +41,7 @@ USE_LONGCLIP="True"
 
 # 最大处理样本数 (-1 表示处理所有样本)
 # 用于快速测试或部分推理
-MAX_SAMPLES=-1
+MAX_SAMPLES=50
 
 # 预训练权重路径
 # CKPT_PATH="./assets/ckpts/PBR_model.safetensors"
@@ -82,12 +82,6 @@ echo "Use Text Adapter: ${USE_TEXT_ADAPTER}"
 echo "GPU IDs: ${GPU_IDS}, Num GPUs: ${NUM_GPUS}, Workers/GPU: ${WORKERS_PER_GPU}"
 echo "Total parallel workers: $((NUM_GPUS * WORKERS_PER_GPU))"
 echo "Textures will be stored under: ${OUTPUT_ROOT}/textures"
-
-# 单GPU时直接设置 CUDA_VISIBLE_DEVICES（必须在 python 启动前设置）
-if [ "${NUM_GPUS}" -eq 1 ]; then
-    export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
-    echo "Single GPU mode: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
-fi
 
 python3 texture.py objaverse \
 --tsv-path "${BATCH_TSV}" \

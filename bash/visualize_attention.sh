@@ -15,7 +15,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称
-EXP_NAME="texverse_stage2_finetune"
+EXP_NAME="texverse_stage1_new_modules_v7"
 
 # TSV 路径 (批量模式使用)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -30,7 +30,7 @@ CAPTION_FIELD="caption_long"
 MAX_SAMPLES=2
 
 # 预训练权重路径
-CKPT_PATH="../experiments/texverse_stage2_finetune/2026.02.25-23:15:19_lr_5e-05_num_views_8/best_ckpt/model.safetensors"
+CKPT_PATH="../experiments/texverse_stage1_new_modules_v7/2026.02.26-20:49:30_lr_0.0004_num_views_8/best_ckpt/model.safetensors"
 
 # 点云目录
 POINTCLOUD_DIR="../datasets/texverse_pointcloud_npz"
