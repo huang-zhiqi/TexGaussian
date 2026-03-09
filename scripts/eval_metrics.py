@@ -189,11 +189,13 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Which metrics to compute. Presets: all | pixel (psnr,ssim,lpips) | "
-            "dist (fid,kid) | semantic (clip) | consistency (multi-view). "
+            "dist (fid,kid,clip_fid,cmmd) | semantic (clip) | consistency (multi-view). "
             "Pixel metrics are computed per unlit channel. "
+            "clip_fid uses CLIP features instead of Inception (clean-fid). "
+            "cmmd uses CLIP Maximum Mean Discrepancy (clip-mmd). "
             "CLIP text similarity uses caption_short and LongCLIP uses caption_long when --prompts_file is provided. "
             "Multi-view consistency metrics detect Janus/flickering issues. "
-            "You can also pass a comma list, e.g., 'psnr,ssim,clip,consistency'."
+            "You can also pass a comma list, e.g., 'psnr,ssim,clip,clip_fid,cmmd,consistency'."
         ),
     )
     parser.add_argument(
@@ -220,6 +222,16 @@ def parse_args() -> argparse.Namespace:
             "GPU ID to use (e.g., '0', '1', '2,3'). Sets CUDA_VISIBLE_DEVICES before "
             "CUDA init so torch.device('cuda') maps to the selected GPU. "
             "If not specified, uses the existing CUDA_VISIBLE_DEVICES environment variable."
+        ),
+    )
+    parser.add_argument(
+        "--fid_white_bg",
+        action="store_true",
+        help=(
+            "Use white background instead of black when computing FID/KID. "
+            "RGBA images are alpha-composited onto a white background before "
+            "being fed to InceptionV3. This reduces the influence of the "
+            "(typically ~80%%) background region on distribution metrics."
         ),
     )
     return parser.parse_args()
@@ -389,6 +401,7 @@ def compute_lit_metrics_for_paths(
     do_clip_text: bool,
     do_longclip_text: bool,
     kid_subset_size_default: int,
+    fid_white_bg: bool = False,
 ) -> Dict[str, float]:
     lit_metrics: Dict[str, float] = {}
 
@@ -425,12 +438,14 @@ def compute_lit_metrics_for_paths(
                     clip_preprocess,
                     device,
                     include_clip=do_clip_image or do_clip_text,
+                    white_bg=fid_white_bg,
                 )
                 _, gt_uint8, gt_clip = load_batch(
                     batch_gt_paths,
                     clip_preprocess,
                     device,
                     include_clip=do_clip_image,
+                    white_bg=fid_white_bg,
                 )
 
                 gen_feat = None
@@ -541,7 +556,133 @@ def compute_lit_metrics_for_paths(
         del kid_metric
     _clear_cuda_cache()
 
+    # --- CLIP-FID (clean-fid with CLIP features) ---
+    if metric_flags.get("clip_fid", False):
+        lit_metrics.update(
+            _compute_clip_fid(lit_gt_paths, lit_gen_paths, device, fid_white_bg)
+        )
+
+    # --- CMMD (CLIP Maximum Mean Discrepancy) ---
+    if metric_flags.get("cmmd", False):
+        lit_metrics.update(
+            _compute_cmmd(lit_gt_paths, lit_gen_paths, device, fid_white_bg)
+        )
+
     return lit_metrics
+
+
+def _prepare_flat_image_dir(
+    image_paths: List[str],
+    white_bg: bool,
+) -> str:
+    """Create a temp directory with flat symlinks (or composited PNGs) for directory-based metrics.
+
+    If white_bg is True, composites RGBA onto white and saves real PNGs.
+    Otherwise, creates symlinks (fast, no disk I/O).
+    Returns the path to the temp directory (caller must clean up).
+    """
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="eval_flatdir_")
+    for idx, src_path in enumerate(image_paths):
+        dst_name = f"{idx:06d}.png"
+        dst_path = os.path.join(tmp_dir, dst_name)
+        if white_bg:
+            img = Image.open(src_path)
+            if img.mode == "RGBA":
+                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                img = Image.alpha_composite(bg, img).convert("RGB")
+            else:
+                img = img.convert("RGB")
+            img.save(dst_path)
+        else:
+            os.symlink(os.path.abspath(src_path), dst_path)
+    return tmp_dir
+
+
+def _compute_clip_fid(
+    gt_paths: List[str],
+    gen_paths: List[str],
+    device: torch.device,
+    white_bg: bool,
+) -> Dict[str, float]:
+    """Compute CLIP-FID using clean-fid library."""
+    import shutil
+
+    try:
+        from cleanfid import fid as cleanfid
+    except ImportError:
+        print("[WARN] clean-fid not installed; skipping CLIP-FID. pip install clean-fid")
+        return {}
+
+    print("Computing CLIP-FID (clean-fid, model=clip_vit_b_32)...")
+    gt_dir = _prepare_flat_image_dir(gt_paths, white_bg)
+    gen_dir = _prepare_flat_image_dir(gen_paths, white_bg)
+    try:
+        score = cleanfid.compute_fid(
+            fdir1=gt_dir,
+            fdir2=gen_dir,
+            mode="clean",
+            model_name="clip_vit_b_32",
+            batch_size=64,
+            device=device,
+            verbose=False,
+        )
+        print(f"  CLIP_FID = {score:.4f}")
+        return {"CLIP_FID": score}
+    except Exception as exc:
+        print(f"[WARN] CLIP-FID computation failed: {exc}")
+        traceback.print_exc()
+        return {"CLIP_FID": float("nan")}
+    finally:
+        shutil.rmtree(gt_dir, ignore_errors=True)
+        shutil.rmtree(gen_dir, ignore_errors=True)
+        _clear_cuda_cache()
+
+
+def _compute_cmmd(
+    gt_paths: List[str],
+    gen_paths: List[str],
+    device: torch.device,
+    white_bg: bool,
+) -> Dict[str, float]:
+    """Compute CMMD using clip-mmd library."""
+    import shutil
+
+    try:
+        from clip_mmd.logic import CMMD
+    except ImportError:
+        print("[WARN] clip-mmd not installed; skipping CMMD. pip install clip-mmd")
+        return {}
+
+    print("Computing CMMD (clip-mmd, model=clip-vit-large-patch14-336)...")
+    gt_dir = _prepare_flat_image_dir(gt_paths, white_bg)
+    gen_dir = _prepare_flat_image_dir(gen_paths, white_bg)
+    try:
+        gpu_str = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+        first_gpu = int(gpu_str.split(",")[0]) if gpu_str else 0
+        cmmd = CMMD(
+            infer=True,
+            device=str(device),
+            device_ids=[first_gpu],
+            feat_bs=64,
+            num_workers=4,
+            low_mem=True,
+        )
+        score = cmmd.execute(gt_dir, gen_dir)
+        if isinstance(score, torch.Tensor):
+            score = score.item()
+        print(f"  CMMD = {score:.6f}")
+        return {"CMMD": float(score)}
+    except Exception as exc:
+        print(f"[WARN] CMMD computation failed: {exc}")
+        traceback.print_exc()
+        return {"CMMD": float("nan")}
+    finally:
+        shutil.rmtree(gt_dir, ignore_errors=True)
+        shutil.rmtree(gen_dir, ignore_errors=True)
+        _clear_cuda_cache()
 
 
 def compute_mean_metrics(metrics_by_group: Dict[str, Dict[str, float]]) -> Dict[str, float]:
@@ -565,16 +706,16 @@ def compute_mean_metrics(metrics_by_group: Dict[str, Dict[str, float]]) -> Dict[
 def parse_metrics_arg(metrics_arg: str) -> Dict[str, bool]:
     metrics_arg = metrics_arg.lower().replace(" ", "")
     presets = {
-        "all": {"psnr", "ssim", "lpips", "fid", "kid", "clip", "consistency"},
+        "all": {"psnr", "ssim", "lpips", "fid", "kid", "clip_fid", "cmmd", "clip", "consistency"},
         "pixel": {"psnr", "ssim", "lpips"},
         "structural": {"psnr", "ssim", "lpips"},
-        "dist": {"fid", "kid"},
-        "distribution": {"fid", "kid"},
+        "dist": {"fid", "kid", "clip_fid", "cmmd"},
+        "distribution": {"fid", "kid", "clip_fid", "cmmd"},
         "semantic": {"clip"},
         "consistency": {"consistency"},
         "geometric": {"consistency"},
     }
-    supported: Set[str] = {"psnr", "ssim", "lpips", "fid", "kid", "clip", "consistency"}
+    supported: Set[str] = {"psnr", "ssim", "lpips", "fid", "kid", "clip_fid", "cmmd", "clip", "consistency"}
     if metrics_arg in presets:
         selected = presets[metrics_arg]
     else:
@@ -1861,8 +2002,15 @@ def load_batch(
     device: torch.device,
     include_clip: bool,
     keep_alpha: bool = False,
+    white_bg: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Load images as float [0,1], uint8 [0,255], and optionally CLIP-preprocessed batches."""
+    """Load images as float [0,1], uint8 [0,255], and optionally CLIP-preprocessed batches.
+
+    Args:
+        white_bg: If True, alpha-composite RGBA images onto a white background
+            instead of the default black. Only affects the uint8/float outputs
+            (used by FID/KID); the CLIP branch is unchanged.
+    """
     float_batch: List[torch.Tensor] = []
     uint8_batch: List[torch.Tensor] = []
     clip_batch: List[torch.Tensor] = []
@@ -1877,7 +2025,13 @@ def load_batch(
                     clip_tensor = clip_preprocess(clip_img).unsqueeze(0)  # type: ignore[arg-type]
                     clip_batch.append(clip_tensor)
 
-                img = img.convert("RGBA" if keep_alpha else "RGB")
+                if keep_alpha:
+                    img = img.convert("RGBA")
+                elif white_bg and img.mode == "RGBA":
+                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                    img = Image.alpha_composite(bg, img).convert("RGB")
+                else:
+                    img = img.convert("RGB")
                 np_img = np.array(img, dtype=np.uint8)
 
             uint8_tensor = torch.from_numpy(np_img).permute(2, 0, 1)
@@ -1935,7 +2089,7 @@ def main() -> None:
     do_clip_image = metric_flags["clip"]
     do_clip_text = metric_flags["clip"] and args.prompts_file is not None
     do_longclip_text = metric_flags["clip"] and args.prompts_file is not None
-    do_lit_metrics = metric_flags["fid"] or metric_flags["kid"] or do_clip_image or do_clip_text or do_longclip_text
+    do_lit_metrics = metric_flags["fid"] or metric_flags["kid"] or metric_flags.get("clip_fid", False) or metric_flags.get("cmmd", False) or do_clip_image or do_clip_text or do_longclip_text
     do_unlit_metrics = metric_flags["psnr"] or metric_flags["ssim"] or metric_flags["lpips"]
 
     if do_lit_metrics:
@@ -2073,6 +2227,7 @@ def main() -> None:
             do_clip_text,
             do_longclip_text,
             args.kid_subset_size,
+            fid_white_bg=args.fid_white_bg,
         )
         for metric_name, value in lit_metrics.items():
             final_metrics[metric_name] = value
