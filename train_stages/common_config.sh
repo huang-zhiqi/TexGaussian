@@ -1,22 +1,37 @@
 #!/bin/bash
 # =============================================================================
-# 共享配置文件 - 所有训练阶段共用
+# 共享配置文件 - 所有训练阶段共用（PSNR + FID/CLIP 双目标）
 # =============================================================================
 
 # 1. 初始化 Conda 环境
-CONDA_BASE="$(conda info --base)"
+CONDA_EXE_PATH="${CONDA_EXE:-$(type -P conda || true)}"
+if [[ -z "${CONDA_EXE_PATH}" ]]; then
+  echo "[ERROR] conda not found in PATH."
+  exit 1
+fi
+CONDA_BASE="$(cd "$(dirname "${CONDA_EXE_PATH}")/.." && pwd)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate texgaussian
+# conda activate 脚本通常不兼容 nounset，激活前临时关闭 -u 更稳妥。
+__had_nounset=0
+if [[ $- == *u* ]]; then
+  __had_nounset=1
+fi
+set +u
+CONDA_NO_PLUGINS=true conda activate texgaussian
+if [[ $__had_nounset -eq 1 ]]; then
+  set -u
+fi
+unset __had_nounset
 
 # CUDA 环境
 export TORCH_CUDA_ARCH_LIST="8.6;8.9"
 export CUDA_HOME="$CONDA_PREFIX/targets/x86_64-linux"
 export PATH="$CONDA_PREFIX/nvvm/bin:$CONDA_PREFIX/targets/x86_64-linux/bin:$CONDA_PREFIX/bin:$PATH"
-export CPATH="$CONDA_PREFIX/include:${CPATH}"
-export C_INCLUDE_PATH="$CONDA_PREFIX/include:${C_INCLUDE_PATH}"
-export CPLUS_INCLUDE_PATH="$CONDA_PREFIX/include:${CPLUS_INCLUDE_PATH}"
-export LIBRARY_PATH="$CONDA_PREFIX/lib:${LIBRARY_PATH}"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
+export CPATH="$CONDA_PREFIX/include:${CPATH:-}"
+export C_INCLUDE_PATH="$CONDA_PREFIX/include:${C_INCLUDE_PATH:-}"
+export CPLUS_INCLUDE_PATH="$CONDA_PREFIX/include:${CPLUS_INCLUDE_PATH:-}"
+export LIBRARY_PATH="$CONDA_PREFIX/lib:${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 # =========================
 # 显存优化配置 (防止OOM)
@@ -68,6 +83,34 @@ LONGCLIP_CONTEXT_LENGTH=248
 USE_TEXT="True"
 USE_MATERIAL="True"
 MIXED_PRECISION="bf16"
+
+# =========================
+# FID/CLIP 训练目标（所有阶段默认启用）
+# =========================
+# 训练 supervision = 重建损失(PSNR/LPIPS/material/mask) + 语义/分布损失(CLIP + color stats)
+USE_CLIP_SEMANTIC_LOSS="True"
+CLIP_LOSS_MODEL="ViT-B/32"
+CLIP_LOSS_NUM_VIEWS=2
+CLIP_LOSS_RANDOM_VIEWS="True"
+CLIP_LOSS_USE_GT_MASK="True"
+CLIP_LOSS_IMG_SIZE=224
+
+# Stage1 推荐值：image=0.20, text=0.05, color=0.05；Stage2 可适当降低
+LAMBDA_CLIP_IMAGE=0.20
+LAMBDA_CLIP_TEXT=0.05
+LAMBDA_COLOR_STATS=0.05
+
+# 0.0=仅pred alpha加权（旧行为）；1.0=仅GT mask加权
+ALPHA_GT_BLEND=0.25
+
+# Eval / best checkpoint 统一走 FID
+COMPUTE_EVAL_FID="True"
+EVAL_FID_USE_GT_MASK="True"
+BEST_SELECTION_METRIC="fid"
+
+# FID-safe 优化开关（Stage1 默认 True；Stage2 若需要解冻base请显式设为 False）
+FID_SAFE_MODE="True"
+TRAIN_CONV_HEAD="False"
 
 # =========================
 # 验证样本 (用于检查训练效果)

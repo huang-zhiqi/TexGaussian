@@ -55,7 +55,7 @@ class CollateBatch:
             elif 'gaussian' in key:
                 outputs[key] = torch.cat(outputs[key], dim = 0)
             
-            elif 'uid' in key:
+            elif key == 'uid' or key == 'text':
                 pass
         
             else:
@@ -597,6 +597,7 @@ class TexGaussianDataset(Dataset):
                 text = item.get("caption_long")
             elif item.get("caption_short"):
                 text = item.get("caption_short")
+            results['text'] = text
 
             if self.use_longclip:
                 token = self.longclip_tokenize(

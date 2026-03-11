@@ -22,7 +22,16 @@ from datetime import datetime
 import os
 
 
-def save_training_state(accelerator, optimizer, scheduler, epoch, max_eval_psnr, save_path):
+def save_training_state(
+    accelerator,
+    optimizer,
+    scheduler,
+    epoch,
+    max_eval_psnr,
+    min_eval_fid,
+    best_selection_metric,
+    save_path,
+):
     """
     保存完整的训练状态，用于恢复中断的训练。
     
@@ -37,7 +46,9 @@ def save_training_state(accelerator, optimizer, scheduler, epoch, max_eval_psnr,
     
     state = {
         'epoch': epoch,
-        'max_eval_psnr': max_eval_psnr,
+        'max_eval_psnr': float(max_eval_psnr),
+        'min_eval_fid': float(min_eval_fid),
+        'best_selection_metric': best_selection_metric,
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
     }
@@ -45,7 +56,10 @@ def save_training_state(accelerator, optimizer, scheduler, epoch, max_eval_psnr,
     os.makedirs(save_path, exist_ok=True)
     state_file = os.path.join(save_path, 'training_state.pt')
     torch.save(state, state_file)
-    accelerator.print(f"[INFO] Saved training state to {state_file} (epoch={epoch}, max_psnr={max_eval_psnr:.4f})")
+    accelerator.print(
+        f"[INFO] Saved training state to {state_file} "
+        f"(epoch={epoch}, max_psnr={max_eval_psnr:.4f}, min_fid={min_eval_fid:.4f})"
+    )
 
 
 def load_training_state(accelerator, optimizer, scheduler, state_path):
@@ -55,10 +69,12 @@ def load_training_state(accelerator, optimizer, scheduler, state_path):
     返回：
     - start_epoch: 从哪个 epoch 开始继续训练
     - max_eval_psnr: 恢复的最佳评估 PSNR
+    - min_eval_fid: 恢复的最佳评估 FID
+    - best_selection_metric: 恢复的 best_ckpt 选择指标
     """
     if not os.path.exists(state_path):
         accelerator.print(f"[WARN] Training state file not found: {state_path}")
-        return 0, 0.0
+        return 0, float('-inf'), float('inf'), 'psnr'
     
     state = torch.load(state_path, map_location='cpu')
     
@@ -77,11 +93,25 @@ def load_training_state(accelerator, optimizer, scheduler, state_path):
         accelerator.print(f"[WARN] Failed to restore scheduler state: {e}")
     
     start_epoch = state.get('epoch', 0) + 1  # 从下一个 epoch 开始
-    max_eval_psnr = state.get('max_eval_psnr', 0.0)
+    max_eval_psnr = state.get('max_eval_psnr', float('-inf'))
+    min_eval_fid = state.get('min_eval_fid', float('inf'))
+    best_selection_metric = state.get('best_selection_metric', 'psnr')
+    if torch.is_tensor(max_eval_psnr):
+        max_eval_psnr = float(max_eval_psnr.item())
+    else:
+        max_eval_psnr = float(max_eval_psnr)
+    if torch.is_tensor(min_eval_fid):
+        min_eval_fid = float(min_eval_fid.item())
+    else:
+        min_eval_fid = float(min_eval_fid)
     
-    accelerator.print(f"[INFO] Resuming training from epoch {start_epoch}, max_eval_psnr={max_eval_psnr:.4f}")
+    accelerator.print(
+        f"[INFO] Resuming training from epoch {start_epoch}, "
+        f"max_eval_psnr={max_eval_psnr:.4f}, min_eval_fid={min_eval_fid:.4f}, "
+        f"best_metric={best_selection_metric}"
+    )
     
-    return start_epoch, max_eval_psnr
+    return start_epoch, max_eval_psnr, min_eval_fid, best_selection_metric
 
 
 def get_time():
@@ -113,9 +143,25 @@ def main():
     opt.unfreeze_attn_kv = str2bool(opt.unfreeze_attn_kv)
     opt.unfreeze_attn_qo = str2bool(opt.unfreeze_attn_qo)
     opt.unfreeze_norms = str2bool(opt.unfreeze_norms)
+    opt.fid_safe_mode = str2bool(opt.fid_safe_mode)
+    opt.train_conv_head = str2bool(opt.train_conv_head)
     opt.use_text = str2bool(opt.use_text)
     opt.use_longclip = str2bool(opt.use_longclip)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
+    opt.compute_eval_fid = str2bool(opt.compute_eval_fid)
+    opt.eval_fid_use_gt_mask = str2bool(opt.eval_fid_use_gt_mask)
+    opt.use_clip_semantic_loss = str2bool(opt.use_clip_semantic_loss)
+    opt.clip_loss_random_views = str2bool(opt.clip_loss_random_views)
+    opt.clip_loss_use_gt_mask = str2bool(opt.clip_loss_use_gt_mask)
+
+    # FID-safe preset: conservative adaptation when using GGCA/TextAdapter.
+    if opt.fid_safe_mode and (opt.use_ggca or opt.use_text_adapter):
+        opt.freeze_base = True
+        opt.unfreeze_attn_kv = True
+        opt.unfreeze_attn_qo = False
+        opt.unfreeze_norms = True
+        if opt.adapt_lr_scale > 0.05:
+            opt.adapt_lr_scale = 0.03
 
     # 决定 workspace 路径
     # 如果是恢复训练（指定了 resume_training_state），使用原来的 workspace
@@ -163,6 +209,16 @@ def main():
     accelerator = Accelerator(
         mixed_precision=opt.mixed_precision,
         gradient_accumulation_steps=opt.gradient_accumulation_steps,
+    )
+
+    accelerator.print(
+        f"[INFO] FID-safe={opt.fid_safe_mode}, freeze_base={opt.freeze_base}, "
+        f"unfreeze_kv={opt.unfreeze_attn_kv}, unfreeze_qo={opt.unfreeze_attn_qo}, "
+        f"unfreeze_norms={opt.unfreeze_norms}, adapt_lr_scale={opt.adapt_lr_scale}, "
+        f"train_conv_head={opt.train_conv_head}, best_metric={opt.best_selection_metric}, "
+        f"clip_loss={opt.use_clip_semantic_loss}, lambda_clip_img={opt.lambda_clip_image}, "
+        f"lambda_clip_text={opt.lambda_clip_text}, lambda_color_stats={opt.lambda_color_stats}, "
+        f"alpha_gt_blend={opt.alpha_gt_blend}"
     )
 
     device = accelerator.device
@@ -283,7 +339,7 @@ def main():
     # optimizer
     # =========================================================================
     # Three-tier parameter grouping:
-    #   Tier 1 (head_params, full LR): GGCA + TextAdapter + conv_out + conv
+    #   Tier 1 (head_params, full LR): GGCA + TextAdapter (+ conv_out + conv if train_conv_head=True)
     #   Tier 2 (adapt_params, adapt_lr_scale × LR): CA K,V projections + norms
     #   Tier 3 (frozen): everything else
     #
@@ -309,12 +365,14 @@ def main():
             accelerator.print(f"[INFO] Including ggca_mid in head_params (GGCA@512 at up_blocks.1)")
         if hasattr(model, "text_adapter") and model.text_adapter is not None:
             head_params += list(model.text_adapter.parameters())
-        if hasattr(model, "model"):
+        if opt.train_conv_head and hasattr(model, "model"):
             for layer_name in ['conv_out', 'conv']:
                 layer = getattr(model.model, layer_name, None)
                 if layer is not None:
                     head_params += list(layer.parameters())
                     accelerator.print(f"[INFO] Including {layer_name} in head_params (trainable with GGCA)")
+        else:
+            accelerator.print("[INFO] Keeping conv/conv_out out of head params (FID-safe).")
         head_param_ids = {id(p) for p in head_params}
 
         # --- Tier 2: adapted base params (lower LR) ---
@@ -446,14 +504,20 @@ def main():
 
     iter_start_time = time.time()
 
-    max_eval_psnr = 0
+    max_eval_psnr = float('-inf')
+    min_eval_fid = float('inf')
     start_epoch = 0
 
     # 恢复训练状态（如果指定）
     if opt.resume_training_state is not None:
-        start_epoch, max_eval_psnr = load_training_state(
+        start_epoch, max_eval_psnr, min_eval_fid, state_best_metric = load_training_state(
             accelerator, optimizer, scheduler, opt.resume_training_state
         )
+        if opt.best_selection_metric != state_best_metric:
+            accelerator.print(
+                f"[WARN] best_selection_metric mismatch: cli={opt.best_selection_metric}, "
+                f"state={state_best_metric}. Using cli value."
+            )
         accelerator.print(f"[INFO] Will train from epoch {start_epoch} to {opt.num_epochs-1}")
 
     # loop
@@ -477,6 +541,9 @@ def main():
                 albedo_loss = out['albedo_loss']
                 mask_loss = out['mask_loss']
                 lpips_loss = out['lpips_loss']
+                clip_image_loss = float(out.get('clip_image_loss', 0.0))
+                clip_text_loss = float(out.get('clip_text_loss', 0.0))
+                color_stats_loss = float(out.get('color_stats_loss', 0.0))
 
                 if opt.use_material:
                     rough_loss = out['roughness_loss']
@@ -517,19 +584,24 @@ def main():
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} loss: {loss.item():.6f} \
 gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} roughness_loss: {rough_loss:.6f} \
-metallic_loss: {metallic_loss:.6f} mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
+metallic_loss: {metallic_loss:.6f} mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} \
+clip_img_loss: {clip_image_loss:.6f} clip_text_loss: {clip_text_loss:.6f} color_stats_loss: {color_stats_loss:.6f} time: {t:.3f}")
 
                     else:
                         print(f"[INFO] {i}/{len(train_dataloader)} mem: {(mem_total-mem_free)/1024**3:.2f}/{mem_total/1024**3:.2f}G \
 lr: {optimizer.state_dict()['param_groups'][0]['lr']:.7f} \
 loss: {loss.item():.6f} gaussian_loss: {gaussian_loss:.6f} albedo_loss: {albedo_loss:.6f} \
-mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
+mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} \
+clip_img_loss: {clip_image_loss:.6f} clip_text_loss: {clip_text_loss:.6f} color_stats_loss: {color_stats_loss:.6f} time: {t:.3f}")
 
                     writer.add_scalar('loss', out['loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('gaussian_loss', out['gaussian_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('albedo_loss', out['albedo_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('mask_loss', out['mask_loss'], epoch * len(train_dataloader) + i)
                     writer.add_scalar('lpips_loss', out['lpips_loss'], epoch * len(train_dataloader) + i)
+                    writer.add_scalar('clip_image_loss', clip_image_loss, epoch * len(train_dataloader) + i)
+                    writer.add_scalar('clip_text_loss', clip_text_loss, epoch * len(train_dataloader) + i)
+                    writer.add_scalar('color_stats_loss', color_stats_loss, epoch * len(train_dataloader) + i)
                     writer.add_scalar('psnr', out['psnr'], epoch * len(train_dataloader) + i)
 
                     if opt.use_material:
@@ -648,6 +720,29 @@ mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
             metallic_total_psnr = 0
 
         model.eval()
+        eval_fid = float('nan')
+        eval_fid_metric = None
+        if opt.compute_eval_fid:
+            try:
+                from torchmetrics.image.fid import FrechetInceptionDistance
+                eval_fid_metric = FrechetInceptionDistance(feature=2048, normalize=False).to(device)
+            except Exception as e:
+                accelerator.print(
+                    "[WARN] Failed to init Eval_FID metric: "
+                    f"{e}. Install deps with: `pip install torchmetrics torch-fidelity`. "
+                    "Skip Eval_FID this epoch."
+                )
+                eval_fid_metric = None
+
+        # Sync eval_fid_metric availability across all ranks to prevent
+        # asymmetric gather_for_metrics calls (which would deadlock).
+        _fid_ok = torch.tensor([1 if eval_fid_metric is not None else 0], device=device, dtype=torch.int)
+        _fid_ok = accelerator.gather_for_metrics(_fid_ok)
+        if _fid_ok.min().item() == 0:
+            if eval_fid_metric is not None:
+                accelerator.print("[WARN] Eval_FID init failed on some ranks; disabling for this epoch.")
+                del eval_fid_metric
+                eval_fid_metric = None
 
         # eval
         with torch.no_grad():
@@ -664,6 +759,28 @@ mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
                     metallic_psnr = out['metallic_psnr']
                     rough_total_psnr += rough_psnr.detach()
                     metallic_total_psnr += metallic_psnr.detach()
+
+                if eval_fid_metric is not None:
+                    fid_gt = data['images_output']
+                    fid_pred = out['images_pred']
+                    if opt.eval_fid_use_gt_mask:
+                        fid_mask = data['masks_output']
+                        fid_gt = fid_gt * fid_mask
+                        fid_pred = fid_pred * fid_mask
+
+                    bsz, nview = fid_gt.shape[0], fid_gt.shape[1]
+                    fid_h, fid_w = fid_gt.shape[-2], fid_gt.shape[-1]
+                    fid_gt = (fid_gt.clamp(0, 1) * 255).to(torch.uint8).view(
+                        bsz * nview, 3, fid_h, fid_w
+                    )
+                    fid_pred = (fid_pred.clamp(0, 1) * 255).to(torch.uint8).view(
+                        bsz * nview, 3, fid_h, fid_w
+                    )
+                    fid_gt = accelerator.gather_for_metrics(fid_gt)
+                    fid_pred = accelerator.gather_for_metrics(fid_pred)
+                    if accelerator.is_main_process:
+                        eval_fid_metric.update(fid_gt, real=True)
+                        eval_fid_metric.update(fid_pred, real=False)
 
                 # save some images
                 if accelerator.is_main_process:
@@ -721,6 +838,24 @@ mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
         if opt.use_material:
             rough_total_psnr = accelerator.gather_for_metrics(rough_total_psnr).mean()
             metallic_total_psnr = accelerator.gather_for_metrics(metallic_total_psnr).mean()
+        if eval_fid_metric is not None:
+            # compute() runs InceptionV3 statistics (heavy); run on ALL ranks that
+            # accumulated features, then only use the result on main_process.
+            try:
+                torch.cuda.synchronize()
+                eval_fid = eval_fid_metric.compute().item()
+                torch.cuda.synchronize()
+            except Exception as e:
+                accelerator.print(f"[WARN] Eval_FID compute failed: {e}")
+                eval_fid = float('nan')
+        del eval_fid_metric
+        torch.cuda.empty_cache()
+
+        # Barrier to ensure all ranks are past FID computation before the
+        # next collective (save_best gather). Prevents timeout if rank 0
+        # FID compute is slow.
+        accelerator.wait_for_everyone()
+
         if accelerator.is_main_process:
             total_psnr /= len(test_dataloader)
             if opt.use_material:
@@ -728,18 +863,48 @@ mask_loss: {mask_loss:.6f} lpips_loss: {lpips_loss:.6f} time: {t:.3f}")
                 metallic_total_psnr /= len(test_dataloader)
                 accelerator.print(
                     f"[eval] epoch: {epoch} psnr: {total_psnr:.4f} "
-                    f"rough_psnr: {rough_total_psnr:.4f} metallic_psnr: {metallic_total_psnr:.4f}"
+                    f"rough_psnr: {rough_total_psnr:.4f} metallic_psnr: {metallic_total_psnr:.4f} "
+                    f"eval_fid: {eval_fid:.4f}"
                 )
             else:
-                accelerator.print(f"[eval] epoch: {epoch} psnr: {total_psnr:.4f}")
+                accelerator.print(f"[eval] epoch: {epoch} psnr: {total_psnr:.4f} eval_fid: {eval_fid:.4f}")
+            writer.add_scalar('eval_psnr', total_psnr, epoch)
+            if np.isfinite(eval_fid):
+                writer.add_scalar('eval_fid', eval_fid, epoch)
 
-        if total_psnr > max_eval_psnr:
-            max_eval_psnr = total_psnr
+        psnr_value = total_psnr.item() if torch.is_tensor(total_psnr) else float(total_psnr)
+        save_best = False
+        if accelerator.is_main_process:
+            if opt.best_selection_metric == 'fid':
+                if np.isfinite(eval_fid) and eval_fid < min_eval_fid:
+                    min_eval_fid = eval_fid
+                    max_eval_psnr = max(max_eval_psnr, psnr_value)
+                    save_best = True
+            else:
+                if psnr_value > max_eval_psnr:
+                    max_eval_psnr = psnr_value
+                    if np.isfinite(eval_fid):
+                        min_eval_fid = min(min_eval_fid, eval_fid)
+                    save_best = True
+
+        save_best_tensor = torch.tensor([1 if save_best else 0], device=device, dtype=torch.int)
+        save_best = bool(accelerator.gather_for_metrics(save_best_tensor).max().item())
+
+        if save_best:
             accelerator.wait_for_everyone()
             save_path = f'{opt.workspace}/best_ckpt'
             accelerator.save_model(model, save_path)
             # 同时保存训练状态
-            save_training_state(accelerator, optimizer, scheduler, epoch, max_eval_psnr, save_path)
+            save_training_state(
+                accelerator,
+                optimizer,
+                scheduler,
+                epoch,
+                max_eval_psnr,
+                min_eval_fid,
+                opt.best_selection_metric,
+                save_path,
+            )
         
         # Epoch 结束时的内存清理
         torch.cuda.empty_cache()

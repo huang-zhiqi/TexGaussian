@@ -1,8 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# v10 —— 新模块训练 (GGCA + TextAdapter)
+# Stage1 —— FID/CLIP 导向的新模块训练 (GGCA + TextAdapter)
 # =============================================================================
-# 双层文本注入：解码器 GGCA ×2 + TextAdapter
+# 核心目标：在保持重建质量（PSNR/LPIPS/material）的同时，直接优化语义与分布指标
+#           通过 CLIP image/text loss + color stats matching，改善 FID/KID/CLIP_FID/CMMD。
 #
 # ┌─────────────────────────────────────────────────────────────────┐
 # │  编码器 (Encoder)                                              │
@@ -24,24 +25,18 @@
 # └─────────────────────────────────────────────────────────────────┘
 #
 # TextAdapter (394K): 768→256→768, 2层, 残差缩放=0.1
-#   LongCLIP 特征适配，统一文本流 → CA + GGCA
+#   LongCLIP 特征适配，统一文本流 → CA + GGCA。
 #
 # 三层参数分组（base 冻结）：
-#   Tier 1（head, 全量LR=4e-4）：新增模块 ~4.9M
-#     - GGCA@64 (1.09M): 输出层几何门融合
-#     - GGCA@512 (3.41M): 解码器高维文本融合
-#     - TextAdapter (394K): LongCLIP 文本适配
-#     - conv_out + conv (20K)
-#   Tier 2（adapt, 0.1×LR=4e-5）：~15.8M
-#     - CA K+V+Q+O (15.7M) + Norms (0.07M)
-#   Tier 3（base）：~274M  [冻结！保护预训练特征]
+#   Tier 1（head, 全量LR）：GGCA@64 + GGCA@512 + TextAdapter
+#   Tier 2（adapt, 降LR）：CA K/V + Norms（FID-safe preset）
+#   Tier 3（base）：冻结（保护预训练分布）
 #
-# v10 训练配置:
-#   - NUM_EPOCHS=20
-#   - GRAD_ACC=1: 无梯度累积
-#   - LAMBDA_LPIPS=2.0: 感知损失权重
-#   - ADAPT_LR_SCALE=0.1: CA 层用 0.1× 学习率
-#   - gradient_clip=1.0
+# Stage1(FID/CLIP版) 配置:
+#   - FID-safe=True（保守解冻）
+#   - best_selection_metric=fid
+#   - CLIP语义损失 + 颜色统计损失
+#   - 重建损失仍保留（MSE/material/mask/LPIPS）
 # =============================================================================
 
 set -e
@@ -58,8 +53,8 @@ export CUDA_LAUNCH_BLOCKING=0
 # =========================
 # 阶段1 特定配置
 # =========================
-STAGE_NAME="v10_new_modules"
-EXP_NAME="texverse_stage1_new_modules_v10"
+STAGE_NAME="Stage1_FIDCLIP_NewModules"
+EXP_NAME="texverse_stage1_fidclip_v11"
 WORKSPACE="${EXPERIMENTS_ROOT}/${EXP_NAME}"
 
 # 自动查找最新的 checkpoint（支持多个来源）
@@ -140,22 +135,24 @@ else
   echo "[INFO] 从预训练模型开始新的 Stage1 训练"
 fi
 
-# 特征开关 — v10
-USE_TEXT_ADAPTER="True"    # LongCLIP 特征适配（768→256→768, 394K）
-USE_GGCA="True"            # GGCA×2（ggca@64 几何门 + ggca_mid@512 标量门）
-FREEZE_BASE="True"         # 冻结 base（保护预训练特征）
-UNFREEZE_ATTN_KV="True"   # 解冻 CA K,V 投影
-UNFREEZE_ATTN_QO="True"   # 解冻 CA Q,O 投影
-UNFREEZE_NORMS="True"     # 解冻所有 GroupNorm/LayerNorm
-ADAPT_LR_SCALE=0.1        # CA+Norms 用 0.1× 学习率
-GRADIENT_CLIP=1.0          # 梯度裁剪阈值
+# 特征开关 — Stage1 FID/CLIP
+USE_TEXT_ADAPTER="True"
+USE_GGCA="True"
+FREEZE_BASE="True"         # Stage1 只做稳态适配，不全量解冻
+UNFREEZE_ATTN_KV="True"
+UNFREEZE_ATTN_QO="False"
+UNFREEZE_NORMS="True"
+ADAPT_LR_SCALE=0.03
+GRADIENT_CLIP=1.0
+FID_SAFE_MODE="True"
+TRAIN_CONV_HEAD="False"
 
-# 优化配置
-BATCH_SIZE=4
-GRAD_ACC=1                 # 无梯度累积
+# 优化配置（重建 + 语义/分布联合监督）
+BATCH_SIZE=2
+GRAD_ACC=2                 # effective batch = BATCH_SIZE × NUM_GPUS × GRAD_ACC
 NUM_EPOCHS=20
-LR=4e-4
-LAMBDA_LPIPS=2.0           # LPIPS感知损失权重
+LR=3e-4
+LAMBDA_LPIPS=0.5
 EMA_RATE=0.9999
 
 # =========================
@@ -183,15 +180,23 @@ fi
 print_stage_info "${STAGE_NAME}" "${WORKSPACE}" "${RESUME_CKPT}"
 
 echo "  Resume Mode: ${RESUME_MODE} (stage1=恢复训练, pretrained=新训练)"
-echo "  TextAdapter: ${USE_TEXT_ADAPTER} (768→256→768, 394K)"
-echo "  GGCA: ${USE_GGCA} (ggca@64 几何门 + ggca_mid@512 标量门, ~4.5M)"
-echo "  Freeze Base: ${FREEZE_BASE} (base 冻结，保护预训练特征)"
-echo "  Unfreeze K,V: ${UNFREEZE_ATTN_KV} (12层 CA 的 K,V 投影 → 9.4M params)"
-echo "  Unfreeze Q,O: ${UNFREEZE_ATTN_QO} (12层 CA 的 Q,O 投影 → 6.3M params)"
-echo "  Unfreeze Norms: ${UNFREEZE_NORMS} (所有 GroupNorm/LayerNorm → 0.07M params)"
-echo "  Adapt LR Scale: ${ADAPT_LR_SCALE} (CA+Norms 学习率 = LR × ${ADAPT_LR_SCALE})"
+echo "  TextAdapter: ${USE_TEXT_ADAPTER}"
+echo "  GGCA: ${USE_GGCA}"
+echo "  Freeze Base: ${FREEZE_BASE}"
+echo "  Unfreeze K,V: ${UNFREEZE_ATTN_KV}"
+echo "  Unfreeze Q,O: ${UNFREEZE_ATTN_QO}"
+echo "  Unfreeze Norms: ${UNFREEZE_NORMS}"
+echo "  FID-safe mode: ${FID_SAFE_MODE}"
+echo "  Train conv head: ${TRAIN_CONV_HEAD}"
+echo "  Adapt LR Scale: ${ADAPT_LR_SCALE}"
 echo "  Gradient Clip: ${GRADIENT_CLIP}"
 echo "  lambda_lpips: ${LAMBDA_LPIPS}"
+echo "  clip_loss_model: ${CLIP_LOSS_MODEL}"
+echo "  lambda_clip_image: ${LAMBDA_CLIP_IMAGE}"
+echo "  lambda_clip_text: ${LAMBDA_CLIP_TEXT}"
+echo "  lambda_color_stats: ${LAMBDA_COLOR_STATS}"
+echo "  alpha_gt_blend: ${ALPHA_GT_BLEND}"
+echo "  best_selection_metric: ${BEST_SELECTION_METRIC}"
 echo "  ema_rate: ${EMA_RATE}"
 echo "  Grad Accumulation: ${GRAD_ACC} (effective batch = BATCH_SIZE × NUM_GPUS × GRAD_ACC)"
 echo "  Learning Rate: ${LR}"
@@ -292,11 +297,26 @@ ARGS=(
   --use_ggca "${USE_GGCA}"
   --use_text_adapter "${USE_TEXT_ADAPTER}"
   --freeze_base "${FREEZE_BASE}"
+  --fid_safe_mode "${FID_SAFE_MODE}"
+  --train_conv_head "${TRAIN_CONV_HEAD}"
   --unfreeze_attn_kv "${UNFREEZE_ATTN_KV}"
   --unfreeze_attn_qo "${UNFREEZE_ATTN_QO}"
   --unfreeze_norms "${UNFREEZE_NORMS}"
   --adapt_lr_scale "${ADAPT_LR_SCALE}"
   --lambda_lpips "${LAMBDA_LPIPS}"
+  --use_clip_semantic_loss "${USE_CLIP_SEMANTIC_LOSS}"
+  --clip_loss_model "${CLIP_LOSS_MODEL}"
+  --clip_loss_num_views "${CLIP_LOSS_NUM_VIEWS}"
+  --clip_loss_random_views "${CLIP_LOSS_RANDOM_VIEWS}"
+  --clip_loss_use_gt_mask "${CLIP_LOSS_USE_GT_MASK}"
+  --clip_loss_img_size "${CLIP_LOSS_IMG_SIZE}"
+  --lambda_clip_image "${LAMBDA_CLIP_IMAGE}"
+  --lambda_clip_text "${LAMBDA_CLIP_TEXT}"
+  --lambda_color_stats "${LAMBDA_COLOR_STATS}"
+  --alpha_gt_blend "${ALPHA_GT_BLEND}"
+  --compute_eval_fid "${COMPUTE_EVAL_FID}"
+  --eval_fid_use_gt_mask "${EVAL_FID_USE_GT_MASK}"
+  --best_selection_metric "${BEST_SELECTION_METRIC}"
   --ema_rate "${EMA_RATE}"
   --gradient_clip "${GRADIENT_CLIP}"
   --resume "${RESUME_CKPT}"
@@ -313,13 +333,11 @@ if [[ "${RESUME_MODE}" == "stage1" ]]; then
   fi
 fi
 
-echo "[INFO] Starting v10 Training..."
+echo "[INFO] Starting Stage1 FID/CLIP Training..."
 echo "[INFO] Memory optimization: PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 echo "[INFO] Effective batch = ${BATCH_SIZE} × ${NUM_GPUS} × ${GRAD_ACC} = $((BATCH_SIZE * NUM_GPUS * GRAD_ACC))"
-echo "[INFO] Tier 1 (head, LR=${LR}): GGCA@64(1.09M) + GGCA@512(3.41M) + TextAdapter(394K) + conv(20K) ≈ 4.9M"
-echo "[INFO] Tier 2 (adapt, LR=${LR}×${ADAPT_LR_SCALE}): CA K,V,Q,O(15.7M) + Norms(0.07M)"
-echo "[INFO] Tier 3 (base): FROZEN (~274M)"
-echo "[INFO] Trainable: ~20.7M params (Tier 1 + Tier 2)"
+echo "[INFO] Objective = reconstruction + LPIPS + CLIP(image/text) + color_stats"
+echo "[INFO] Checkpoint selection = ${BEST_SELECTION_METRIC}"
 
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" accelerate launch "${ARGS[@]}" \
   2> >(grep -v -E '^libpng warning: eXIf: duplicate$' >&2)
@@ -336,14 +354,14 @@ fi
 # =========================
 echo ""
 echo "=============================================="
-echo " v10 训练完成！"
+echo " Stage1 FID/CLIP 训练完成！"
 echo "==============================================" 
 echo ""
 echo " 检查要点:"
-echo "   1. albedo 颜色是否正确"
-echo "   2. albedo_loss / material_loss 稳步下降"
-echo "   3. PSNR 达到 22-25"
+echo "   1. 重建指标: psnr/albedo_loss/material_loss"
+echo "   2. 语义/分布指标: eval_fid, clip_image_loss, clip_text_loss, color_stats_loss"
+echo "   3. 离线评估: FID/KID/CLIP_FID/CMMD 是否优于 baseline"
 echo ""
 echo " 下一步:"
-echo "   a) 使用当前模型进行推理和评估"
-echo "   b) 或进行 Stage2 微调"
+echo "   a) 使用 best_ckpt 做离线 metrics 评估"
+echo "   b) 如仍有提升空间，再进行 Stage2 低LR微调"

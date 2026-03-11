@@ -34,6 +34,8 @@ class Options:
     unfreeze_attn_qo: str = 'False'  # Unfreeze CrossAttention Q,O projections (adapts query and output)
     unfreeze_norms: str = 'False'  # Unfreeze all GroupNorm/LayerNorm affine params
     adapt_lr_scale: float = 0.1  # Learning rate multiplier for unfrozen base params (K,V,Q,O,norms)
+    fid_safe_mode: str = 'True'  # Apply FID-safe preset for adapter/GGCA training
+    train_conv_head: str = 'False'  # Train conv/conv_out in head param group (often hurts FID if True)
     use_text: str = 'True'
     use_local_pretrained_ckpt: str = 'False'
     text_description: str = 'Cap3D_automated_Objaverse_full.csv'
@@ -104,6 +106,12 @@ class Options:
     batch_size: int = 8
     # ckpt interval
     ckpt_interval: int = 1
+    # compute validation FID during eval loop (distribution metric for checkpoint selection)
+    compute_eval_fid: str = 'True'
+    # use GT mask to black-bg both GT/pred before Eval_FID update
+    eval_fid_use_gt_mask: str = 'True'
+    # checkpoint selection metric
+    best_selection_metric: Literal['psnr', 'fid'] = 'fid'
     # image interval
     image_interval: int = 100
     # gradient accumulation
@@ -112,6 +120,20 @@ class Options:
     num_epochs: int = 1000
     # lpips loss weight
     lambda_lpips: float = 1.0
+    # CLIP semantic/distillation losses (optimize CLIP-family metrics directly)
+    use_clip_semantic_loss: str = 'True'
+    clip_loss_model: str = 'ViT-B/32'
+    clip_loss_num_views: int = 2
+    clip_loss_random_views: str = 'True'
+    clip_loss_use_gt_mask: str = 'True'
+    clip_loss_img_size: int = 224
+    lambda_clip_image: float = 0.2
+    lambda_clip_text: float = 0.05
+    # Color moment matching (helps global distribution metrics like FID/KID)
+    lambda_color_stats: float = 0.05
+    # Blend GT mask into alpha-weighted reconstruction supervision
+    # 0.0: pred-alpha only (old behavior), 1.0: GT-mask only
+    alpha_gt_blend: float = 0.25
     # gradient clip
     gradient_clip: float = 1.0
     # mixed precision

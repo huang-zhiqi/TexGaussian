@@ -36,5 +36,7 @@ open3d
 bpy
 blendertoolbox
 tensorboard
+torchmetrics
+torch-fidelity
 pymeshlab
 argparse

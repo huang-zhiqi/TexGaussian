@@ -9,6 +9,7 @@ import ocnn
 
 from kiui.lpips import LPIPS
 import open3d as o3d
+from external.clip import clip as clip_module
 
 # from core.unet import UNet
 from core.octree_unet import OctreeUNet
@@ -244,6 +245,76 @@ class TexGaussian(nn.Module):
                 self.lpips_loss = LPIPS(net ='vgg')
             self.lpips_loss.requires_grad_(False)
 
+        # CLIP semantic losses (feature-space supervision for CLIP/FID-family metrics)
+        self.use_clip_semantic_loss = _as_bool(getattr(self.opt, "use_clip_semantic_loss", False))
+        self.clip_loss_random_views = _as_bool(getattr(self.opt, "clip_loss_random_views", True))
+        self.clip_loss_use_gt_mask = _as_bool(getattr(self.opt, "clip_loss_use_gt_mask", True))
+        self.clip_loss_num_views = max(1, int(getattr(self.opt, "clip_loss_num_views", 2)))
+        self.clip_loss_img_size = int(getattr(self.opt, "clip_loss_img_size", 224))
+        self.lambda_clip_image = float(getattr(self.opt, "lambda_clip_image", 0.0))
+        self.lambda_clip_text = float(getattr(self.opt, "lambda_clip_text", 0.0))
+        self.lambda_color_stats = float(getattr(self.opt, "lambda_color_stats", 0.0))
+        self.alpha_gt_blend = float(getattr(self.opt, "alpha_gt_blend", 0.0))
+        self.alpha_gt_blend = min(1.0, max(0.0, self.alpha_gt_blend))
+
+        self.register_buffer(
+            "clip_image_mean",
+            torch.tensor([0.48145466, 0.45782750, 0.40821073], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "clip_image_std",
+            torch.tensor([0.26862954, 0.26130258, 0.27577711], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+        self.clip_loss_model = None
+        self.clip_tokenize = None
+        if self.use_clip_semantic_loss and (self.lambda_clip_image > 0 or self.lambda_clip_text > 0):
+            clip_loss_model_name = getattr(self.opt, "clip_loss_model", "ViT-B/32")
+            try:
+                self.clip_loss_model, _ = clip_module.load(name=clip_loss_model_name, device=self.device, jit=False)
+                self.clip_loss_model = self.clip_loss_model.float()
+                self.clip_loss_model.eval()
+                for p in self.clip_loss_model.parameters():
+                    p.requires_grad = False
+                self.clip_tokenize = clip_module.tokenize
+                print(
+                    f"[INFO] CLIP semantic loss enabled: model={clip_loss_model_name}, "
+                    f"lambda_img={self.lambda_clip_image}, lambda_text={self.lambda_clip_text}, "
+                    f"views={self.clip_loss_num_views}"
+                )
+            except Exception as e:
+                print(f"[WARN] Failed to load CLIP semantic model; disabling CLIP losses. Error: {e}")
+                self.clip_loss_model = None
+                self.clip_tokenize = None
+                self.use_clip_semantic_loss = False
+
+    def _clip_encode_image(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode images with CLIP loss model, handling full-sequence VisionTransformer output."""
+        feat = self.clip_loss_model.encode_image(images)
+        if feat.ndim == 3:
+            # VisionTransformer returns [N, seq_len, width]; manually pool CLS + project
+            feat = self.clip_loss_model.visual.ln_post(feat[:, 0, :])
+            if self.clip_loss_model.visual.proj is not None:
+                feat = feat @ self.clip_loss_model.visual.proj
+        return feat
+
+    def _prepare_clip_image_batch(self, images_01: torch.Tensor) -> torch.Tensor:
+        x = images_01.clamp(0, 1).float()
+        x = F.interpolate(x, size=(self.clip_loss_img_size, self.clip_loss_img_size), mode='bicubic', align_corners=False)
+        x = (x - self.clip_image_mean) / self.clip_image_std
+        return x
+
+    @staticmethod
+    def _masked_channel_moments(images: torch.Tensor, masks: torch.Tensor):
+        # images: [B, V, 3, H, W], masks: [B, V, 1, H, W]
+        denom = masks.sum(dim=(-1, -2), keepdim=True).clamp(min=1e-6)
+        mean = (images * masks).sum(dim=(-1, -2), keepdim=True) / denom
+        var = (((images - mean) ** 2) * masks).sum(dim=(-1, -2), keepdim=True) / denom
+        std = torch.sqrt(var + 1e-6)
+        return mean, std
+
     def reset_parameters(self):
         self.ema_model.load_state_dict(self.model.state_dict())
         if hasattr(self, 'ema_text_adapter') and hasattr(self, 'text_adapter') and self.text_adapter is not None:
@@ -255,10 +326,11 @@ class TexGaussian(nn.Module):
             update_moving_average(self.ema_text_adapter, self.text_adapter, self.ema_updater)
 
     def state_dict(self, **kwargs):
-        # remove lpips_loss
+        # Remove auxiliary frozen loss networks from checkpoints.
+        # They are not part of inference-time parameters.
         state_dict = super().state_dict(**kwargs)
         for k in list(state_dict.keys()):
-            if 'lpips_loss' in k:
+            if 'lpips_loss' in k or 'clip_loss_model' in k:
                 del state_dict[k]
         return state_dict
 
@@ -421,6 +493,8 @@ class TexGaussian(nn.Module):
         # (pred_alpha > 0).  Coverage is handled separately by mask_loss,
         # so holes between Gaussians do not inject spurious gradients.
         alpha_w = pred_alphas.detach()  # [B, V, 1, H, W] – stop gradient
+        if self.alpha_gt_blend > 0:
+            alpha_w = (1.0 - self.alpha_gt_blend) * alpha_w + self.alpha_gt_blend * gt_masks
         albedo_loss = ((pred_images - gt_images) ** 2 * alpha_w).sum() / (alpha_w.sum() * 3 + 1e-6)
         if self.opt.use_material:
             # Material Gaussians share the same pos/scale/opacity → same holes as albedo
@@ -462,7 +536,76 @@ class TexGaussian(nn.Module):
             loss_lpips = self.lpips_loss(gt_resized, pred_resized).mean() * self.opt.lambda_lpips
             loss = loss + loss_lpips
 
-        results['lpips_loss'] = self.opt.lambda_lpips * loss_lpips.item()
+        # CLIP feature matching loss (image-image + image-text) and color moment matching.
+        clip_image_loss = torch.zeros(1, device=gaussians.device)
+        clip_text_loss = torch.zeros(1, device=gaussians.device)
+        color_stats_loss = torch.zeros(1, device=gaussians.device)
+
+        if self.lambda_color_stats > 0:
+            pred_mean, pred_std = self._masked_channel_moments(pred_images, gt_masks)
+            gt_mean, gt_std = self._masked_channel_moments(gt_images, gt_masks)
+            color_stats_loss = F.l1_loss(pred_mean, gt_mean) + F.l1_loss(pred_std, gt_std)
+            loss = loss + self.lambda_color_stats * color_stats_loss
+
+        if (
+            self.use_clip_semantic_loss
+            and (not ema)
+            and self.clip_loss_model is not None
+            and (self.lambda_clip_image > 0 or self.lambda_clip_text > 0)
+        ):
+            bsz, nview = pred_images.shape[:2]
+            view_count = min(self.clip_loss_num_views, nview)
+            if view_count < nview:
+                if self.training and self.clip_loss_random_views:
+                    view_idx = torch.randperm(nview, device=pred_images.device)[:view_count]
+                else:
+                    view_idx = torch.arange(view_count, device=pred_images.device)
+                pred_for_clip = pred_images[:, view_idx, ...]
+                gt_for_clip = gt_images[:, view_idx, ...]
+                mask_for_clip = gt_masks[:, view_idx, ...]
+            else:
+                pred_for_clip = pred_images
+                gt_for_clip = gt_images
+                mask_for_clip = gt_masks
+
+            if self.clip_loss_use_gt_mask:
+                pred_for_clip = pred_for_clip * mask_for_clip
+                gt_for_clip = gt_for_clip * mask_for_clip
+
+            pred_clip = self._prepare_clip_image_batch(
+                pred_for_clip.reshape(-1, 3, pred_for_clip.shape[-2], pred_for_clip.shape[-1])
+            )
+            pred_feat = F.normalize(self._clip_encode_image(pred_clip), dim=-1)
+
+            if self.lambda_clip_image > 0:
+                gt_clip = self._prepare_clip_image_batch(
+                    gt_for_clip.reshape(-1, 3, gt_for_clip.shape[-2], gt_for_clip.shape[-1])
+                )
+                gt_feat = F.normalize(self._clip_encode_image(gt_clip), dim=-1)
+                clip_image_loss = (1.0 - (pred_feat * gt_feat).sum(dim=-1)).mean()
+                loss = loss + self.lambda_clip_image * clip_image_loss
+
+            if self.lambda_clip_text > 0 and self.clip_tokenize is not None and ('text' in data):
+                text_list = data['text']
+                if isinstance(text_list, str):
+                    text_list = [text_list]
+                text_list = [
+                    t if isinstance(t, str) and len(t.strip()) > 0 else "an object with realistic texture"
+                    for t in text_list
+                ]
+                try:
+                    text_tokens = self.clip_tokenize(text_list, truncate=True).to(self.device)
+                except TypeError:
+                    text_tokens = self.clip_tokenize(text_list).to(self.device)
+                text_feat = F.normalize(self.clip_loss_model.encode_text(text_tokens), dim=-1)
+                text_feat = text_feat.repeat_interleave(view_count, dim=0)
+                clip_text_loss = (1.0 - (pred_feat * text_feat).sum(dim=-1)).mean()
+                loss = loss + self.lambda_clip_text * clip_text_loss
+
+        results['lpips_loss'] = loss_lpips.item()
+        results['clip_image_loss'] = clip_image_loss.item()
+        results['clip_text_loss'] = clip_text_loss.item()
+        results['color_stats_loss'] = color_stats_loss.item()
 
         results['loss'] = loss
 

@@ -69,7 +69,7 @@ set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高), GPU_ID环境变量选择GPU
-EXPERIMENT_NAME="${1:-texgaussian_baseline}"
+EXPERIMENT_NAME="${1:-texgaussian_mini}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered_test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
 # If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will combine all images
@@ -80,7 +80,7 @@ UNLIT_SUBDIR="${UNLIT_SUBDIR:-"unlit"}"
 # 降低默认批量大小以避免 OOM (从 8 改为 4)
 BATCH_SIZE="${BATCH_SIZE:-8}"
 DEVICE="${DEVICE:-cuda}"
-GPU_ID="${GPU_ID:-6}"
+GPU_ID="${GPU_ID:-0}"
 # KID subset size: 100 is recommended for stable estimation
 KID_SUBSET_SIZE="${KID_SUBSET_SIZE:-100}"
 CLIP_MODEL="${CLIP_MODEL:-"ViT-B/32"}"
