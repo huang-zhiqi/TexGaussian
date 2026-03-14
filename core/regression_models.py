@@ -257,6 +257,12 @@ class TexGaussian(nn.Module):
         self.alpha_gt_blend = float(getattr(self.opt, "alpha_gt_blend", 0.0))
         self.alpha_gt_blend = min(1.0, max(0.0, self.alpha_gt_blend))
 
+        # Reconstruction loss weights
+        self.lambda_albedo = float(getattr(self.opt, "lambda_albedo", 1.0))
+        self.lambda_roughness = float(getattr(self.opt, "lambda_roughness", 1.0))
+        self.lambda_metallic = float(getattr(self.opt, "lambda_metallic", 1.0))
+        self.lambda_mask = float(getattr(self.opt, "lambda_mask", 1.0))
+
         self.register_buffer(
             "clip_image_mean",
             torch.tensor([0.48145466, 0.45782750, 0.40821073], dtype=torch.float32).view(1, 3, 1, 1),
@@ -504,10 +510,14 @@ class TexGaussian(nn.Module):
         mask_loss = F.mse_loss(pred_alphas, gt_masks)
 
         if self.opt.use_material:
-            loss_mse = albedo_loss + rough_loss + metal_loss + mask_loss
-
+            loss_mse = (
+                self.lambda_albedo * albedo_loss +
+                self.lambda_roughness * rough_loss +
+                self.lambda_metallic * metal_loss +
+                self.lambda_mask * mask_loss
+            )
         else:
-            loss_mse = albedo_loss + mask_loss
+            loss_mse = self.lambda_albedo * albedo_loss + self.lambda_mask * mask_loss
 
         results['albedo_loss'] = albedo_loss.item()
         if self.opt.use_material:

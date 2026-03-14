@@ -54,8 +54,12 @@ export CUDA_LAUNCH_BLOCKING=0
 # 阶段1 特定配置
 # =========================
 STAGE_NAME="Stage1_FIDCLIP_NewModules"
-EXP_NAME="texverse_stage1_fidclip_v11"
+EXP_NAME="texverse_stage1_fidclip_v17_woGGCA"
 WORKSPACE="${EXPERIMENTS_ROOT}/${EXP_NAME}"
+TEST_LIST="${SPLIT_DIR}/test_first50.tsv"
+EVAL_FID_MODE="albedo"
+EVAL_FID_WHITE_BG="True"
+EVAL_DETERMINISTIC_VIEWS="True"
 
 # 自动查找最新的 checkpoint（支持多个来源）
 find_latest_ckpt() {
@@ -137,7 +141,7 @@ fi
 
 # 特征开关 — Stage1 FID/CLIP
 USE_TEXT_ADAPTER="True"
-USE_GGCA="True"
+USE_GGCA="False"
 FREEZE_BASE="True"         # Stage1 只做稳态适配，不全量解冻
 UNFREEZE_ATTN_KV="True"
 UNFREEZE_ATTN_QO="False"
@@ -147,11 +151,22 @@ GRADIENT_CLIP=1.0
 FID_SAFE_MODE="True"
 TRAIN_CONV_HEAD="False"
 
+# FID 优先微调：保留 image-level 分布约束，弱化对重建和文本分支的强约束。
+LAMBDA_ALBEDO=0.2
+LAMBDA_ROUGHNESS=0.1
+LAMBDA_METALLIC=0.1
+LAMBDA_MASK=0.1
+LAMBDA_CLIP_IMAGE=0.20
+LAMBDA_CLIP_TEXT=0.05
+LAMBDA_COLOR_STATS=0.05
+ALPHA_GT_BLEND=0.25
+
 # 优化配置（重建 + 语义/分布联合监督）
 BATCH_SIZE=2
 GRAD_ACC=2                 # effective batch = BATCH_SIZE × NUM_GPUS × GRAD_ACC
 NUM_EPOCHS=20
 LR=3e-4
+CKPT_INTERVAL=5
 LAMBDA_LPIPS=0.5
 EMA_RATE=0.9999
 
@@ -197,6 +212,9 @@ echo "  lambda_clip_text: ${LAMBDA_CLIP_TEXT}"
 echo "  lambda_color_stats: ${LAMBDA_COLOR_STATS}"
 echo "  alpha_gt_blend: ${ALPHA_GT_BLEND}"
 echo "  best_selection_metric: ${BEST_SELECTION_METRIC}"
+echo "  eval_fid_mode: ${EVAL_FID_MODE}"
+echo "  eval_fid_white_bg: ${EVAL_FID_WHITE_BG}"
+echo "  eval_deterministic_views: ${EVAL_DETERMINISTIC_VIEWS}"
 echo "  ema_rate: ${EMA_RATE}"
 echo "  Grad Accumulation: ${GRAD_ACC} (effective batch = BATCH_SIZE × NUM_GPUS × GRAD_ACC)"
 echo "  Learning Rate: ${LR}"
@@ -280,6 +298,7 @@ ARGS=(
   --workspace "${WORKSPACE}"
   --batch_size "${BATCH_SIZE}"
   --num_epochs "${NUM_EPOCHS}"
+  --ckpt_interval "${CKPT_INTERVAL}"
   --lr "${LR}"
   --mixed_precision "${MIXED_PRECISION}"
   --gradient_accumulation_steps "${GRAD_ACC}"
@@ -304,6 +323,10 @@ ARGS=(
   --unfreeze_norms "${UNFREEZE_NORMS}"
   --adapt_lr_scale "${ADAPT_LR_SCALE}"
   --lambda_lpips "${LAMBDA_LPIPS}"
+  --lambda_albedo "${LAMBDA_ALBEDO}"
+  --lambda_roughness "${LAMBDA_ROUGHNESS}"
+  --lambda_metallic "${LAMBDA_METALLIC}"
+  --lambda_mask "${LAMBDA_MASK}"
   --use_clip_semantic_loss "${USE_CLIP_SEMANTIC_LOSS}"
   --clip_loss_model "${CLIP_LOSS_MODEL}"
   --clip_loss_num_views "${CLIP_LOSS_NUM_VIEWS}"
@@ -316,6 +339,9 @@ ARGS=(
   --alpha_gt_blend "${ALPHA_GT_BLEND}"
   --compute_eval_fid "${COMPUTE_EVAL_FID}"
   --eval_fid_use_gt_mask "${EVAL_FID_USE_GT_MASK}"
+  --eval_fid_mode "${EVAL_FID_MODE}"
+  --eval_fid_white_bg "${EVAL_FID_WHITE_BG}"
+  --eval_deterministic_views "${EVAL_DETERMINISTIC_VIEWS}"
   --best_selection_metric "${BEST_SELECTION_METRIC}"
   --ema_rate "${EMA_RATE}"
   --gradient_clip "${GRADIENT_CLIP}"

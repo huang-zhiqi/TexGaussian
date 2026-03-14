@@ -331,6 +331,36 @@ class TexGaussianDataset(Dataset):
                         return True
         return False
 
+    def _select_view_ids(self, total_views):
+        if total_views <= 0:
+            return []
+        if self.training or not getattr(self.opt, "eval_deterministic_views", True):
+            return np.random.permutation(total_views).tolist()
+
+        target_views = min(self.opt.num_views, total_views)
+        if target_views >= total_views:
+            return list(range(total_views))
+
+        # Evenly spaced deterministic views reduce eval noise and make FID comparable across epochs.
+        raw_ids = np.linspace(0, total_views - 1, num=target_views, dtype=int).tolist()
+        vids = []
+        seen = set()
+        for vid in raw_ids:
+            if vid not in seen:
+                vids.append(vid)
+                seen.add(vid)
+
+        if len(vids) < target_views:
+            for vid in range(total_views):
+                if vid in seen:
+                    continue
+                vids.append(vid)
+                seen.add(vid)
+                if len(vids) == target_views:
+                    break
+
+        return vids
+
     def _is_valid_item(self, item):
         uid = item["uid"]
         image_root = self.train_image_root if self.training else self.test_image_root
@@ -476,10 +506,10 @@ class TexGaussianDataset(Dataset):
         camera_mode, camera_data = self._camera_source(image_dir)
         if camera_mode == "npz":
             total_views = int(camera_data['poses'].shape[0])
-            vids = np.random.permutation(total_views).tolist()
+            vids = self._select_view_ids(total_views)
         elif camera_mode == "transforms":
             total_views = len(camera_data)
-            vids = np.random.permutation(total_views).tolist()
+            vids = self._select_view_ids(total_views)
 
         for vid in vids:
             if camera_mode == "npz":

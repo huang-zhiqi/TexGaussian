@@ -18,14 +18,14 @@ conda activate blender
 # 2. 路径配置（按需修改）
 
 # 生成结果的 manifest（路径支持相对路径）
-MANIFEST_PATH="../experiments/texgaussian_mini/generated_manifest.tsv"
+MANIFEST_PATH="../experiments/texverse_stage1_fidclip_v17_15epoch_woGGCA/generated_manifest.tsv"
 
 # GT 渲染结果根目录（内部包含 {obj_id}/transforms.json）
 GT_ROOT="../datasets/texverse_rendered_test"
 TRANSFORMS_SUBDIR=""   # 可选：如果 transforms 在子目录内，设置该值
 
 # 输出目录
-OUT_ROOT="../experiments/texgaussian_mini/texverse_gen_renders"
+OUT_ROOT="../experiments/texverse_stage1_fidclip_v17_15epoch_short/texverse_gen_renders"
 
 # HDRI（lit 渲染必需，可配置多个）
 HDRI_PATHS=(
@@ -40,15 +40,15 @@ for hdri in "${HDRI_PATHS[@]}"; do
 done
 
 # 3. 多GPU配置
-GPU_IDS="0,1"                # 使用的GPU ID列表，逗号分隔
-NUM_GPUS=2                # 使用的GPU数量
-WORKERS_PER_GPU="auto"          # 每GPU进程数：'auto' 自动计算，或指定数字
+# GPU_IDS="0,1"                # 使用的GPU ID列表，逗号分隔
+# NUM_GPUS=2                # 使用的GPU数量
+# WORKERS_PER_GPU=2          # 每GPU进程数：'auto' 自动计算，或指定数字
 
 # 4卡配置 (解开注释使用)
 # GPU_IDS="0,1,2,3"
-# GPU_IDS="3,4,5,6"
-# NUM_GPUS=4
-# WORKERS_PER_GPU=1
+GPU_IDS="3,4,5,6"
+NUM_GPUS=4
+WORKERS_PER_GPU=2
 
 echo "=============================================="
 echo "Render Generated Assets with GT Cameras"

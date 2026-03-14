@@ -131,6 +131,49 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
+def _apply_eval_fid_background(images, masks, white_bg):
+    if masks is None:
+        return images
+    bg_value = 1.0 if white_bg else 0.0
+    background = torch.full_like(images, bg_value)
+    return images * masks + background * (1.0 - masks)
+
+
+def _build_proxy_lit_images(albedo, rough=None, metal=None):
+    albedo = albedo.clamp(0, 1)
+    if rough is None or metal is None:
+        return albedo
+
+    rough_rgb = rough.clamp(0, 1).expand(-1, -1, 3, -1, -1)
+    metal_rgb = metal.clamp(0, 1).expand(-1, -1, 3, -1, -1)
+
+    diffuse = albedo * (1.0 - 0.5 * metal_rgb)
+    spec_tint = 0.04 * (1.0 - metal_rgb) + albedo * metal_rgb
+    gloss = (1.0 - rough_rgb).clamp(0, 1)
+    specular = spec_tint * (0.15 + 0.85 * gloss.pow(2))
+
+    return (0.7 * diffuse + 0.3 * specular).clamp(0, 1)
+
+
+def _prepare_eval_fid_images(opt, data, out):
+    gt_images = data['images_output']
+    pred_images = out['images_pred']
+    gt_masks = data['masks_output'] if opt.eval_fid_use_gt_mask else None
+
+    if opt.eval_fid_mode == 'proxy_lit':
+        rough_gt = data.get('rough_images_output') if opt.use_material else None
+        metal_gt = data.get('metallic_images_output') if opt.use_material else None
+        rough_pred = out.get('rough_images_pred') if opt.use_material else None
+        metal_pred = out.get('metallic_images_pred') if opt.use_material else None
+
+        gt_images = _build_proxy_lit_images(gt_images, rough_gt, metal_gt)
+        pred_images = _build_proxy_lit_images(pred_images, rough_pred, metal_pred)
+
+    gt_images = _apply_eval_fid_background(gt_images, gt_masks, opt.eval_fid_white_bg)
+    pred_images = _apply_eval_fid_background(pred_images, gt_masks, opt.eval_fid_white_bg)
+    return gt_images, pred_images
+
+
 def main():
     opt = tyro.cli(AllConfigs)
 
@@ -150,6 +193,8 @@ def main():
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
     opt.compute_eval_fid = str2bool(opt.compute_eval_fid)
     opt.eval_fid_use_gt_mask = str2bool(opt.eval_fid_use_gt_mask)
+    opt.eval_fid_white_bg = str2bool(opt.eval_fid_white_bg)
+    opt.eval_deterministic_views = str2bool(opt.eval_deterministic_views)
     opt.use_clip_semantic_loss = str2bool(opt.use_clip_semantic_loss)
     opt.clip_loss_random_views = str2bool(opt.clip_loss_random_views)
     opt.clip_loss_use_gt_mask = str2bool(opt.clip_loss_use_gt_mask)
@@ -164,42 +209,40 @@ def main():
             opt.adapt_lr_scale = 0.03
 
     # 决定 workspace 路径
-    # 如果是恢复训练（指定了 resume_training_state），使用原来的 workspace
-    # 否则创建新的带时间戳的文件夹
+    # 无论是否恢复 training state，都创建新的带时间戳的 workspace，
+    # 避免继续训练时写回旧目录并覆盖已有权重。
+    # resume_training_state 只负责恢复 optimizer/scheduler/epoch 等状态。
     #
     # 多 GPU 注意：accelerate launch 会为每个 GPU 启动独立进程，
     # 只有 rank 0 生成时间戳并创建目录，其他进程等待后读取。
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     if opt.resume_training_state is not None and os.path.exists(opt.resume_training_state):
-        # training_state.pt 在 best_ckpt/ 目录下
-        # workspace 结构: experiments/texverse_stage2_xxx/2026.02.17-xxx/best_ckpt/training_state.pt
-        # 需要往上两级找到实际的 experiment workspace
-        state_dir = os.path.dirname(opt.resume_training_state)  # best_ckpt/
-        opt.workspace = os.path.dirname(state_dir)               # 2026.02.17-xxx/
-        print(f"[INFO] Resuming into existing workspace: {opt.workspace}")
-    else:
-        # Rank 0 生成时间戳，写入临时文件；其他 rank 等待并读取
-        workspace_base = opt.workspace
-        stamp_file = os.path.join(workspace_base, ".workspace_stamp")
+        state_dir = os.path.dirname(opt.resume_training_state)
+        resume_workspace = os.path.dirname(state_dir)
+        print(f"[INFO] Resuming training state from: {resume_workspace}")
 
-        if local_rank == 0:
-            current_time = get_time()
-            experiment_name = f"{current_time}_lr_{opt.lr}_num_views_{opt.num_views}"
-            opt.workspace = os.path.join(workspace_base, experiment_name)
-            os.makedirs(opt.workspace, exist_ok=True)
-            # 写入标记文件供其他 rank 读取
-            with open(stamp_file, "w") as f:
-                f.write(opt.workspace)
-        else:
-            # 等待 rank 0 创建标记文件（最多 60 秒）
-            import time as _time
-            for _ in range(600):
-                if os.path.exists(stamp_file):
-                    break
-                _time.sleep(0.1)
-            with open(stamp_file, "r") as f:
-                opt.workspace = f.read().strip()
+    # Rank 0 生成时间戳，写入临时文件；其他 rank 等待并读取
+    workspace_base = opt.workspace
+    stamp_file = os.path.join(workspace_base, ".workspace_stamp")
+
+    if local_rank == 0:
+        current_time = get_time()
+        experiment_name = f"{current_time}_lr_{opt.lr}_num_views_{opt.num_views}"
+        opt.workspace = os.path.join(workspace_base, experiment_name)
+        os.makedirs(opt.workspace, exist_ok=True)
+        # 写入标记文件供其他 rank 读取
+        with open(stamp_file, "w") as f:
+            f.write(opt.workspace)
+    else:
+        # 等待 rank 0 创建标记文件（最多 60 秒）
+        import time as _time
+        for _ in range(600):
+            if os.path.exists(stamp_file):
+                break
+            _time.sleep(0.1)
+        with open(stamp_file, "r") as f:
+            opt.workspace = f.read().strip()
 
     os.makedirs(opt.workspace, exist_ok = True)
 
@@ -216,6 +259,8 @@ def main():
         f"unfreeze_kv={opt.unfreeze_attn_kv}, unfreeze_qo={opt.unfreeze_attn_qo}, "
         f"unfreeze_norms={opt.unfreeze_norms}, adapt_lr_scale={opt.adapt_lr_scale}, "
         f"train_conv_head={opt.train_conv_head}, best_metric={opt.best_selection_metric}, "
+        f"eval_fid_mode={opt.eval_fid_mode}, eval_fid_white_bg={opt.eval_fid_white_bg}, "
+        f"eval_deterministic_views={opt.eval_deterministic_views}, "
         f"clip_loss={opt.use_clip_semantic_loss}, lambda_clip_img={opt.lambda_clip_image}, "
         f"lambda_clip_text={opt.lambda_clip_text}, lambda_color_stats={opt.lambda_color_stats}, "
         f"alpha_gt_blend={opt.alpha_gt_blend}"
@@ -709,11 +754,6 @@ clip_img_loss: {clip_image_loss:.6f} clip_text_loss: {clip_text_loss:.6f} color_
             else:
                 accelerator.print(f"[train] epoch: {epoch} loss: {total_loss.item():.6f} psnr: {total_psnr.item():.4f}")
 
-        # checkpoint
-        if epoch % opt.ckpt_interval == 0:
-            accelerator.wait_for_everyone()
-            accelerator.save_model(model, opt.workspace)
-
         total_psnr = 0
         if opt.use_material:
             rough_total_psnr = 0
@@ -761,12 +801,7 @@ clip_img_loss: {clip_image_loss:.6f} clip_text_loss: {clip_text_loss:.6f} color_
                     metallic_total_psnr += metallic_psnr.detach()
 
                 if eval_fid_metric is not None:
-                    fid_gt = data['images_output']
-                    fid_pred = out['images_pred']
-                    if opt.eval_fid_use_gt_mask:
-                        fid_mask = data['masks_output']
-                        fid_gt = fid_gt * fid_mask
-                        fid_pred = fid_pred * fid_mask
+                    fid_gt, fid_pred = _prepare_eval_fid_images(opt, data, out)
 
                     bsz, nview = fid_gt.shape[0], fid_gt.shape[1]
                     fid_h, fid_w = fid_gt.shape[-2], fid_gt.shape[-1]
@@ -851,11 +886,26 @@ clip_img_loss: {clip_image_loss:.6f} clip_text_loss: {clip_text_loss:.6f} color_
         del eval_fid_metric
         torch.cuda.empty_cache()
 
-        # Barrier to ensure all ranks are past FID computation before the
-        # next collective (save_best gather). Prevents timeout if rank 0
-        # FID compute is slow.
-        accelerator.wait_for_everyone()
+        # Save a checkpoint every `ckpt_interval` epochs, and always on the last epoch.
+        if (epoch + 1) % opt.ckpt_interval == 0 or epoch == opt.num_epochs - 1:
+            accelerator.wait_for_everyone()
+            epoch_save_path = f'{opt.workspace}/epoch_{epoch}'
+            accelerator.save_model(model, epoch_save_path)
+            save_training_state(
+                accelerator,
+                optimizer,
+                scheduler,
+                epoch,
+                total_psnr,  # Save current PSNR for reference
+                eval_fid,    # Save current FID for reference
+                opt.best_selection_metric,
+                epoch_save_path,
+            )
+            accelerator.print(f"[INFO] Epoch {epoch} completed. Checkpoint saved to {epoch_save_path}.")
+        else:
+            accelerator.print(f"[INFO] Epoch {epoch} completed. No checkpoint saved (interval={opt.ckpt_interval}).")
 
+        # Log metrics to the console
         if accelerator.is_main_process:
             total_psnr /= len(test_dataloader)
             if opt.use_material:
@@ -871,45 +921,10 @@ clip_img_loss: {clip_image_loss:.6f} clip_text_loss: {clip_text_loss:.6f} color_
             writer.add_scalar('eval_psnr', total_psnr, epoch)
             if np.isfinite(eval_fid):
                 writer.add_scalar('eval_fid', eval_fid, epoch)
-
-        psnr_value = total_psnr.item() if torch.is_tensor(total_psnr) else float(total_psnr)
-        save_best = False
-        if accelerator.is_main_process:
-            if opt.best_selection_metric == 'fid':
-                if np.isfinite(eval_fid) and eval_fid < min_eval_fid:
-                    min_eval_fid = eval_fid
-                    max_eval_psnr = max(max_eval_psnr, psnr_value)
-                    save_best = True
-            else:
-                if psnr_value > max_eval_psnr:
-                    max_eval_psnr = psnr_value
-                    if np.isfinite(eval_fid):
-                        min_eval_fid = min(min_eval_fid, eval_fid)
-                    save_best = True
-
-        save_best_tensor = torch.tensor([1 if save_best else 0], device=device, dtype=torch.int)
-        save_best = bool(accelerator.gather_for_metrics(save_best_tensor).max().item())
-
-        if save_best:
-            accelerator.wait_for_everyone()
-            save_path = f'{opt.workspace}/best_ckpt'
-            accelerator.save_model(model, save_path)
-            # 同时保存训练状态
-            save_training_state(
-                accelerator,
-                optimizer,
-                scheduler,
-                epoch,
-                max_eval_psnr,
-                min_eval_fid,
-                opt.best_selection_metric,
-                save_path,
-            )
         
         # Epoch 结束时的内存清理
         torch.cuda.empty_cache()
         gc.collect()
-        accelerator.print(f"[INFO] Epoch {epoch} completed. Memory cleaned.")
             
 
     if accelerator.is_main_process:

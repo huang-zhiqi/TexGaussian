@@ -110,6 +110,12 @@ class Options:
     compute_eval_fid: str = 'True'
     # use GT mask to black-bg both GT/pred before Eval_FID update
     eval_fid_use_gt_mask: str = 'True'
+    # validation FID input mode: raw albedo or a material-aware proxy closer to lit benchmark
+    eval_fid_mode: Literal['albedo', 'proxy_lit'] = 'proxy_lit'
+    # use white background composition for Eval_FID, matching offline benchmark defaults
+    eval_fid_white_bg: str = 'True'
+    # use deterministic evenly spaced eval views instead of random view sampling
+    eval_deterministic_views: str = 'True'
     # checkpoint selection metric
     best_selection_metric: Literal['psnr', 'fid'] = 'fid'
     # image interval
@@ -120,6 +126,11 @@ class Options:
     num_epochs: int = 1000
     # lpips loss weight
     lambda_lpips: float = 1.0
+    # reconstruction loss weights
+    lambda_albedo: float = 1.0
+    lambda_roughness: float = 1.0
+    lambda_metallic: float = 1.0
+    lambda_mask: float = 1.0
     # CLIP semantic/distillation losses (optimize CLIP-family metrics directly)
     use_clip_semantic_loss: str = 'True'
     clip_loss_model: str = 'ViT-B/32'
